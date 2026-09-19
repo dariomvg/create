@@ -10,6 +10,11 @@
 
 ---
 
+<img src="https://res.cloudinary.com/duyiov4s1/image/upload/v1789823494/video-demo-cli-dariomvg-create.gif" />
+
+---
+
+
 ## Quick start
 
 Run it from the root of an existing Next.js App Router project:

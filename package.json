@@ -1,6 +1,6 @@
 {
   "name": "@dariomvg/create",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "CLI | add Auth - AI - Payments - Email to Next.js projects",
   "type": "module",
   "bin": {
