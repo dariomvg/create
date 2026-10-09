@@ -1,32 +1,126 @@
-# Auth0 Authentication Module
+# Auth0 Basic Auth
 
-Drop-in authentication for a Next.js App Router project, built on
-`@auth0/nextjs-auth0` v4 and Auth0's Universal Login. Covers sign up, sign
-in, sign out, session access, protected Server Components, social login
-(Google, GitHub, Apple, Facebook), email verification, and forgot/reset
-password.
+Authentication for Next.js App Router projects using Auth0 Universal Login (redirect-based, no custom login UI). Provides sign in, sign up, sign out, session access, session refresh, protected Server Components, social login (Google, GitHub, Apple, Facebook), email verification, and forgot/reset password.
+
+Module: `auth` · Provider: `auth0` · Feature: `basic-auth`
 
 ## Dependencies
 
-- `@auth0/nextjs-auth0` (^4.26.1 or newer)
+- `next` (16+, uses `proxy.ts`)
+- `@auth0/nextjs-auth0` (^4.26.1)
+- `server-only`
 
-## File map
+## Environment variables
 
-| File | Where it's used | What it's for |
+Set in `.env.local` at the project root.
+
+| Variable | Required | Description |
 |---|---|---|
-| `types.ts` | anywhere | Shared types (`Auth0User`, `AuthSession`, `AuthResult`, etc.) |
-| `service.ts` | internal only | Auth0Client instance, raw API calls, error normalization. Never import directly. |
-| `actions.ts` | Server Components / Server Actions | `"use server"` — the only server-side entry point |
-| `client.ts` | Client Components | Navigation helpers for buttons/forms (`signIn`, `signUp`, `signOut`, `signInWithOAuth`) |
-| `proxy.ts` | project root | Request interception boundary; mounts `/auth/*` routes |
-| `.env.local` | project root | Environment variables |
+| `AUTH0_DOMAIN` | Yes | Tenant domain, e.g. `your-tenant.us.auth0.com` (no protocol). |
+| `AUTH0_CLIENT_ID` | Yes | Client ID of the Regular Web Application. |
+| `AUTH0_CLIENT_SECRET` | Yes | Client secret of the Regular Web Application. |
+| `AUTH0_SECRET` | Yes | Random string (32+ bytes, hex) used to encrypt the session cookie. |
+| `APP_BASE_URL` | Yes | Public base URL of the app, e.g. `http://localhost:3000`. |
+| `AUTH0_SCOPE` | No | Overrides the default scopes. If set, keep `offline_access`, otherwise `refreshSession()` has no refresh token to use. |
+| `AUTH0_AUDIENCE` | No | API identifier. Only needed to get an access token for a custom API. |
+| `AUTH0_M2M_CLIENT_ID` | Only for `resendVerificationEmail` | Client ID of the Machine-to-Machine app authorized for the Management API. |
+| `AUTH0_M2M_CLIENT_SECRET` | Only for `resendVerificationEmail` | Client secret of that M2M app. |
 
-## Usage
+## File structure
 
-### Protecting a Server Component
+```
+lib/auth/auth0/basic-auth/
+├── types.ts      # Shared types
+├── service.ts    # Internal: Auth0Client instance, Authentication/Management API calls, error mapping
+├── actions.ts    # "use server": public API for Server Components, Server Actions, Route Handlers
+└── client.ts     # Public API for Client Components (navigation helpers)
+
+proxy.ts          # Project root. Calls auth0.middleware(); mounts the SDK auth routes
+.env.local        # Project root
+```
+
+Routes mounted automatically by the SDK through `proxy.ts` (no `route.ts` exists for them):
+
+| Route | Purpose |
+|---|---|
+| `/auth/login` | Starts Universal Login. Accepts `returnTo`, `screen_hint=signup`, `connection`. |
+| `/auth/logout` | Clears the local session and the Auth0 session. Accepts `returnTo`. |
+| `/auth/callback` | Auth0 redirect target after login. |
+| `/auth/profile` | Returns the current user as JSON. |
+
+Import paths: `@/lib/auth/auth0/basic-auth/actions`, `@/lib/auth/auth0/basic-auth/client`, `@/lib/auth/auth0/basic-auth/types`. Never import `service.ts` from outside the folder.
+
+## Public API
+
+### `actions.ts` (server)
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `getUser` | none | `Promise<Auth0User \| null>`. `null` when there is no session. |
+| `getSession` | none | `Promise<AuthSession \| null>`. `null` when there is no session. |
+| `refreshSession` | none | `Promise<AuthResult<AuthSession>>`. Error code `NO_SESSION` if there is no session. |
+| `signOutAction` | `returnTo?: string` (default `"/"`) | Never returns; redirects to `/auth/logout?returnTo=...`. |
+| `forgotPassword` | `email: string` | `Promise<AuthResult>`. Error code `INVALID_EMAIL` if the email has no `@`. Sends Auth0's reset email. |
+| `resendVerificationEmail` | none (uses the current session user) | `Promise<AuthResult>`. Error code `NO_SESSION` if there is no session. Needs the M2M env vars. |
+| `requireAuth` | `returnTo?: string` (default `"/"`) | `Promise<AuthSession>`. Redirects to `/auth/login?returnTo=...` when there is no session. |
+
+### `client.ts` (Client Components)
+
+All functions navigate with `window.location.href` and return `void`.
+
+| Export | Arguments | Behavior |
+|---|---|---|
+| `signIn` | `options?: SignInOptions` (`{ returnTo?, connection? }`) | Goes to `/auth/login`. |
+| `signUp` | `options?: SignUpOptions` (`{ returnTo?, connection? }`) | Goes to `/auth/login` with `screen_hint=signup`. |
+| `signInWithOAuth` | `connection: OAuthConnection`, `returnTo?: string` (default `"/"`) | Goes to `/auth/login` with the given social connection. |
+| `signOut` | `returnTo?: string` (default `"/"`) | Goes to `/auth/logout`. |
+
+### Types (`types.ts`)
+
+```ts
+type OAuthConnection = "google-oauth2" | "github" | "apple" | "facebook";
+
+interface Auth0User {
+  sub: string;
+  email: string;
+  emailVerified: boolean;
+  name?: string;
+  nickname?: string;
+  picture?: string;
+  updatedAt?: string;
+}
+
+interface AuthSession {
+  user: Auth0User;
+  accessToken?: string;
+  idToken?: string;
+  expiresAt: number;
+}
+
+type AuthResult<T = void> =
+  | { success: true; data: T }
+  | { success: false; error: { code: AuthErrorCode; message: string } };
+
+type AuthErrorCode =
+  | "NO_SESSION"
+  | "INVALID_EMAIL"
+  | "USER_NOT_FOUND"
+  | "MANAGEMENT_API_ERROR"
+  | "AUTH0_API_ERROR"
+  | "UNKNOWN_ERROR";
+```
+
+Behavior notes:
+- Functions that return `AuthResult` do not throw; check `success` before reading `data`.
+- Email + password signup/login happens on Auth0's Universal Login page. Reset password also happens on an Auth0-hosted page, reached from the link in the email sent by `forgotPassword`. There is no `resetPassword` function.
+- `forgotPassword` targets the database connection named `Username-Password-Authentication`.
+
+## Examples
+
+Protect a Server Component:
 
 ```tsx
-import { requireAuth } from "@/lib/auth0/actions";
+import { requireAuth } from "@/lib/auth/auth0/basic-auth/actions";
 
 export default async function DashboardPage() {
   const session = await requireAuth("/dashboard");
@@ -34,10 +128,10 @@ export default async function DashboardPage() {
 }
 ```
 
-### Reading the session without redirecting
+Read the user without redirecting:
 
 ```tsx
-import { getUser } from "@/lib/auth0/actions";
+import { getUser } from "@/lib/auth/auth0/basic-auth/actions";
 
 export default async function Header() {
   const user = await getUser();
@@ -45,81 +139,57 @@ export default async function Header() {
 }
 ```
 
-### Sign in / sign up / sign out buttons (Client Component)
+Auth buttons in a Client Component:
 
 ```tsx
 "use client";
-import { signIn, signUp, signOut, signInWithOAuth } from "@/lib/auth0/client";
+import { signIn, signUp, signInWithOAuth, signOut } from "@/lib/auth/auth0/basic-auth/client";
 
 export function AuthButtons() {
   return (
     <>
-      <button onClick={() => signIn()}>Sign in</button>
+      <button onClick={() => signIn({ returnTo: "/dashboard" })}>Sign in</button>
       <button onClick={() => signUp()}>Sign up</button>
-      <button onClick={() => signInWithOAuth("google-oauth2")}>Continue with Google</button>
+      <button onClick={() => signInWithOAuth("google-oauth2", "/dashboard")}>Continue with Google</button>
       <button onClick={() => signOut()}>Sign out</button>
     </>
   );
 }
 ```
 
-### Forgot password (Server Action from a form)
+Forgot password from a form:
 
 ```tsx
-import { forgotPassword } from "@/lib/auth0/actions";
+import { forgotPassword } from "@/lib/auth/auth0/basic-auth/actions";
 
 async function handleForgotPassword(formData: FormData) {
   "use server";
-  const email = formData.get("email") as string;
-  const result = await forgotPassword(email);
+  const result = await forgotPassword(formData.get("email") as string);
   if (!result.success) {
-    // handle result.error
+    console.error(result.error.code, result.error.message);
   }
 }
 ```
 
-Auth0 hosts the actual "set a new password" screen — the email sent by
-`forgotPassword()` links straight to it. This module doesn't implement its
-own reset-password page.
-
-### Refreshing the session
+Refresh the session and resend the verification email:
 
 ```ts
-import { refreshSession } from "@/lib/auth0/actions";
+import { refreshSession, resendVerificationEmail } from "@/lib/auth/auth0/basic-auth/actions";
 
-const result = await refreshSession();
-if (result.success) {
-  // result.data is the refreshed AuthSession
+const refreshed = await refreshSession();
+if (refreshed.success) {
+  console.log(refreshed.data.user.emailVerified);
 }
+
+await resendVerificationEmail();
 ```
 
 ## Configuration
 
-Code alone isn't enough — these steps happen in the Auth0 Dashboard.
+Steps in the Auth0 Dashboard that cannot be done from code.
 
-1. **Create a Regular Web Application** in your Auth0 tenant.
-2. Under **Application URIs**, set:
-   - Allowed Callback URLs: `http://localhost:3000/auth/callback` (+ your production URL)
-   - Allowed Logout URLs: `http://localhost:3000` (+ your production URL)
-3. **Database connection (email + password)**: enable the
-   `Username-Password-Authentication` connection on this application.
-   Under the connection's settings, turn on **"Requires Email
-   Verification"** if you want new users to verify before first login.
-4. **Social connections**: enable and configure Google, GitHub, Apple, and
-   Facebook under *Authentication → Social*. Each requires its own OAuth
-   credentials (Client ID/Secret) from the respective provider's developer
-   console. The connection names used in `client.ts` (`google-oauth2`,
-   `github`, `apple`, `facebook`) must match what Auth0 assigns —
-   double-check under each connection's settings page.
-5. **Universal Login**: no custom UI is needed. Auth0's New Universal
-   Login already includes sign up, sign in, forgot password, and reset
-   password screens. Customize branding under *Branding → Universal
-   Login* if needed.
-6. **(Optional) Machine-to-Machine app for `resendVerificationEmail()`**:
-   create an M2M application authorized for the **Auth0 Management API**
-   with the `create:user_tickets` scope. Use its credentials for
-   `AUTH0_M2M_CLIENT_ID` / `AUTH0_M2M_CLIENT_SECRET`. Skip this step (and
-   remove `resendVerificationEmail` from `actions.ts`) if you're fine
-   relying on the automatic verification email Auth0 sends at signup.
-7. Copy `proxy.ts` to your project root (next to `package.json`), and
-   adjust the import path if your module isn't at `lib/auth0`.
+1. Create a **Regular Web Application**. Under *Application URIs* set Allowed Callback URLs to `<APP_BASE_URL>/auth/callback` and Allowed Logout URLs to `<APP_BASE_URL>` (add the production URL too).
+2. Enable the `Username-Password-Authentication` database connection on the application. In the connection settings, turn on **Requires Email Verification** if users must verify before first login.
+3. Enable the social connections under *Authentication → Social*: Google, GitHub, Apple, Facebook. Each needs its own OAuth credentials from the provider's developer console. The names used by `client.ts` (`google-oauth2`, `github`, `apple`, `facebook`) must match the connection names in Auth0.
+4. Sign up, sign in, forgot password, and reset password screens come from New Universal Login. Customize branding under *Branding → Universal Login*.
+5. For `resendVerificationEmail`: create a **Machine-to-Machine** application authorized for the **Auth0 Management API** with the `update:users` scope (required by `POST /api/v2/jobs/verification-email`, the endpoint `service.ts` calls), and set its credentials in `AUTH0_M2M_CLIENT_ID` / `AUTH0_M2M_CLIENT_SECRET`.

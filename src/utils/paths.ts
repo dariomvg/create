@@ -114,3 +114,23 @@ export function proxyPath(ctx: PathContext): string {
 export function envLocalPath(ctx: PathContext): string {
   return path.join(ctx.projectRoot, '.env.local');
 }
+
+/**
+ * Carpeta dentro del paquete del CLI donde viven las plantillas de los
+ * archivos de instrucciones para IA (AGENTS.md, CLAUDE.md, GEMINI.md).
+ * Van bajo src/ por la misma razón que los templates de módulos: se
+ * publican como archivos crudos (ver "files" en package.json), no los
+ * bundlea tsup.
+ */
+export function resolveAgentDocsDir(): string {
+  return path.join(packageRoot, 'src', 'agent-docs');
+}
+
+/**
+ * Destino de AGENTS.md / CLAUDE.md / GEMINI.md: SIEMPRE la raíz real
+ * del repo, nunca src/. Las herramientas de IA los buscan ahí, igual
+ * que pasa con .env.local — por eso NO usa toProjectPath.
+ */
+export function agentDocPath(ctx: PathContext, fileName: string): string {
+  return path.join(ctx.projectRoot, fileName);
+}

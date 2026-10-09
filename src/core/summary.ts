@@ -9,7 +9,7 @@ const SETUP_FILE = 'SETUP.md';
 
 // TODO: confirmar la URL final (¿formaui.site sigue siendo el sitio
 // de referencia para Rise, o cambia con el rebrand a @dariomvg/create?)
-const MORE_INFO_URL = 'https://www.formaui.site';
+const MORE_INFO_URL = 'https://www.cli.dariomvg.com';
 
 /**
  * Se llama UNA vez al final de todo el flujo, con la lista de

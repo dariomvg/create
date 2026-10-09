@@ -1,38 +1,87 @@
-# Resend Email Module
+# Email — Resend — Sending
 
-A minimal email-sending module for Next.js App Router, built on top of [Resend](https://resend.com).
+Send plain text and HTML emails through Resend from Next.js server code. Both functions accept the same recipient options (multiple recipients, CC, BCC, reply-to) and attachments.
 
 ## Dependencies
 
 - `resend`
 
-## Files
-
-| File | Purpose |
-|---|---|
-| `types.ts` | Shared types for email params and results |
-| `service.ts` | Internal logic — Resend client and low-level send functions. Do not import this directly. |
-| `actions.ts` | Public API — `"use server"` functions to import from your app |
-| `.env.local` | Environment variables |
-
 ## Environment variables
 
+| Variable | Description |
+|---|---|
+| `RESEND_API_KEY` | Resend API key |
+| `EMAIL_FROM` | Default sender address, e.g. `Acme <hello@yourdomain.com>` |
+
+## File structure
+
 ```
-RESEND_API_KEY=
-EMAIL_FROM=
+@/lib/email/resend/sending/
+├── actions.ts   # public API ("use server")
+├── service.ts   # internal logic (Resend client)
+└── types.ts     # params and result types
 ```
 
-- `RESEND_API_KEY`: found in your Resend dashboard under API Keys.
-- `EMAIL_FROM`: the default sender address (e.g. `Acme <onboarding@yourdomain.com>`). The domain must be a [verified domain](https://resend.com/docs/dashboard/domains/introduction) in your Resend account.
+Other files:
 
-## Usage
+| Path | Purpose |
+|---|---|
+| `.env.local` (project root) | `RESEND_API_KEY` and `EMAIL_FROM` |
 
-Import the functions you need from `actions.ts` in any server component or server action.
+## Public API
 
-### Plain text email
+Import from `@/lib/email/resend/sending/actions`. Both functions are server actions and return a result object instead of throwing.
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `sendPlainTextEmail` | `params: SendPlainTextEmailParams` | `Promise<SendEmailResult>` |
+| `sendHtmlEmail` | `params: SendHtmlEmailParams` | `Promise<SendEmailResult>` |
+
+### Parameters
+
+`SendPlainTextEmailParams` and `SendHtmlEmailParams` share every field except the body.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `to` | `string \| string[]` | yes | One or more recipients |
+| `subject` | `string` | yes | |
+| `text` | `string` | yes (`sendPlainTextEmail` only) | Plain text body |
+| `html` | `string` | yes (`sendHtmlEmail` only) | HTML body |
+| `cc` | `string \| string[]` | no | |
+| `bcc` | `string \| string[]` | no | |
+| `replyTo` | `string` | no | |
+| `attachments` | `EmailAttachment[]` | no | |
+
+`EmailAttachment`:
+
+| Field | Type | Required |
+|---|---|---|
+| `filename` | `string` | yes |
+| `content` | `Buffer \| string` | yes |
+| `contentType` | `string` | no |
+
+### Return type
 
 ```ts
-import { sendPlainTextEmail } from "@/lib/email/actions";
+type SendEmailResult =
+  | { success: true; id: string }
+  | { success: false; error: string };
+```
+
+The sender is always `EMAIL_FROM`. Check `result.success` before assuming the email was sent.
+
+## Configuration
+
+1. In the [Resend dashboard](https://resend.com), create an API key (API Keys) and set it as `RESEND_API_KEY`.
+2. Add and verify your sending domain (Domains) by adding the DNS records Resend shows you.
+3. Set `EMAIL_FROM` to an address on that verified domain. Until a domain is verified, Resend only lets you send test emails from `onboarding@resend.dev` to your own account email.
+
+## Examples
+
+Plain text:
+
+```ts
+import { sendPlainTextEmail } from "@/lib/email/resend/sending/actions";
 
 const result = await sendPlainTextEmail({
   to: "user@example.com",
@@ -41,44 +90,24 @@ const result = await sendPlainTextEmail({
 });
 ```
 
-### HTML email
+HTML with multiple recipients, CC, BCC, reply-to and an attachment:
 
 ```ts
-import { sendHtmlEmail } from "@/lib/email/actions";
+import { sendHtmlEmail } from "@/lib/email/resend/sending/actions";
 
 const result = await sendHtmlEmail({
-  to: "user@example.com",
-  subject: "Welcome!",
-  html: "<p>Thanks for signing up.</p>",
-});
-```
-
-### Common parameters
-
-Both functions accept the same additional parameters:
-
-```ts
-await sendHtmlEmail({
   to: ["user1@example.com", "user2@example.com"],
-  subject: "Update",
-  html: "<p>Hello</p>",
+  subject: "Monthly report",
+  html: "<h1>Report</h1><p>See attached.</p>",
   cc: "manager@example.com",
   bcc: ["archive@example.com"],
   replyTo: "support@example.com",
   attachments: [
-    { filename: "invoice.pdf", content: pdfBuffer, contentType: "application/pdf" },
+    { filename: "report.pdf", content: pdfBuffer, contentType: "application/pdf" },
   ],
 });
+
+if (!result.success) {
+  console.error(result.error);
+}
 ```
-
-### Result shape
-
-Both functions return the same result type:
-
-```ts
-type SendEmailResult =
-  | { success: true; id: string }
-  | { success: false; error: string };
-```
-
-Check `result.success` before assuming the email was sent.

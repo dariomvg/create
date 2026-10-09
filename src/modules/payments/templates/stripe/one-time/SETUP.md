@@ -1,166 +1,196 @@
-# Stripe One-time Payments — Setup
+# Stripe — One-time Payments
 
-Self-contained module for one-time payments with Stripe in a Next.js App
-Router project. No subscriptions, no billing — just: create a payment,
-track its status, refund it if needed.
+## Description
+
+One-time payments with Stripe for a Next.js App Router project: hosted Checkout sessions, custom PaymentIntents (embedded card form), payment lookup and status, cancellation, full and partial refunds, saved card listing, and a webhook endpoint.
+
+Every function returns a serializable `ActionResult<T>` and never throws across the module boundary. Amounts are integers in the smallest currency unit (e.g. cents). Timestamps are Unix seconds.
+
+```ts
+type ActionResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string };
+```
 
 ## Dependencies
 
-This module uses:
+| Package | Used by |
+|---|---|
+| `stripe` | `service.ts` (server SDK) |
+| `@stripe/stripe-js` | `client.ts` (browser SDK) |
 
-- [`stripe`](https://www.npmjs.com/package/stripe) — server-side SDK, used in `lib/stripe/service.ts`
-- [`@stripe/stripe-js`](https://www.npmjs.com/package/@stripe/stripe-js) — client-side SDK, used in `lib/stripe/client.ts`
+## Environment variables
 
-Not installed automatically — add them with your package manager of choice
-before using the module.
+| Variable | Scope | Purpose |
+|---|---|---|
+| `STRIPE_SECRET_KEY` | Server | Stripe API secret key. |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Client | Stripe publishable key, used by `client.ts`. |
+| `STRIPE_WEBHOOK_SECRET` | Server | Signing secret of the Stripe webhook endpoint pointing to `/api/webhooks/stripe`. |
 
-## File map
+## File structure
 
 ```
-lib/stripe/
-├── service.ts   # Internal logic + Stripe SDK instance. Don't touch/import directly elsewhere.
-├── actions.ts   # Server Actions — import into Server Components.
-├── types.ts     # Shared types — safe to import anywhere.
-└── client.ts    # Client-side helpers — import into Client Components.
+lib/payments/stripe/one-time/
+├── actions.ts   # Server Actions — import from Server Components / server code
+├── client.ts    # Browser helpers — import from Client Components
+├── types.ts     # Shared types — safe to import anywhere
+└── service.ts   # Internal Stripe logic — never import it from outside this folder
 
 app/api/webhooks/stripe/
-└── route.ts     # Webhook endpoint. Register this URL in your Stripe Dashboard.
-
-.env.local       # Stripe keys (see below).
+└── route.ts     # Webhook endpoint (POST)
 ```
 
-## 1. Environment variables
+Import alias: `@/lib/payments/stripe/one-time/<file>`.
 
-Fill in `.env.local`:
+Webhook event handling lives in `service.ts` → `stripeService.handleWebhookEvent` (logs only by default). Order fulfillment logic for each event goes there.
 
-| Variable | Where to get it |
-|---|---|
-| `STRIPE_SECRET_KEY` | Dashboard → Developers → API keys |
-| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Dashboard → Developers → API keys |
-| `STRIPE_WEBHOOK_SECRET` | Dashboard → Developers → Webhooks (or `stripe listen` output locally) |
+## Public API
 
-## 2. Webhooks
+### `actions.ts` (server)
 
-In the Stripe Dashboard, add an endpoint pointing to:
+| Export | Arguments | Returns |
+|---|---|---|
+| `createCheckoutSession` | `params: CreateCheckoutSessionParams` | `ActionResult<{ url: string \| null; sessionId: string }>` |
+| `createPaymentIntent` | `params: CreatePaymentIntentParams` | `ActionResult<{ clientSecret: string \| null; id: string }>` |
+| `getPayment` | `paymentIntentId: string` | `ActionResult<PaymentSummary>` |
+| `getPaymentStatus` | `paymentIntentId: string` | `ActionResult<PaymentStatus>` |
+| `cancelPayment` | `paymentIntentId: string` | `ActionResult<{ id: string; status: string }>` |
+| `refundPayment` | `params: RefundParams` (omit `amount` for a full refund) | `ActionResult<RefundSummary>` |
+| `listPaymentMethods` | `customerId: string` | `ActionResult<PaymentMethodSummary[]>` (cards only) |
+| `handleStripeWebhook` | `rawBody: string, signature: string` | `ActionResult<{ received: true }>` |
 
-```
-https://yourdomain.com/api/webhooks/stripe
-```
+Validation: `amount` must be `> 0` on create functions and on partial refunds; id arguments must be non-empty.
 
-Subscribe it to at least:
+### `client.ts` (browser)
 
-- `payment_intent.succeeded`
-- `payment_intent.payment_failed`
-- `payment_intent.canceled`
-- `charge.refunded`
-- `checkout.session.completed`
+| Export | Arguments | Returns |
+|---|---|---|
+| `redirectToCheckout` | `sessionId: string` | `Promise<ActionResult<{ redirected: true }>>` |
+| `confirmCardPayment` | `clientSecret: string, paymentMethodId: string` | `Promise<ActionResult<{ status: string }>>` |
+| `getStripe` | none | `Promise<Stripe \| null>` — shared Stripe.js instance, for Elements |
 
-For local testing, use the Stripe CLI:
+### `app/api/webhooks/stripe/route.ts`
 
-```
-stripe listen --forward-to localhost:3000/api/webhooks/stripe
-```
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | `request: Request` (needs the `stripe-signature` header; reads the raw body) | `200 { received: true }` · `400 { error: string }` |
 
-Business logic for what happens on each event (fulfill an order, send an
-email, etc.) goes inside `stripeService.handleWebhookEvent` in `service.ts`
-— that's the one part of `service.ts` meant to be extended as your app grows.
+Events handled: `payment_intent.succeeded`, `payment_intent.payment_failed`, `payment_intent.canceled`, `charge.refunded`, `checkout.session.completed`.
 
-## 3. Usage
-
-### Hosted Checkout (simplest — redirect to a Stripe-hosted page)
-
-Server side, in a Server Component or a form action:
+### Key types (`types.ts`)
 
 ```ts
-import { createCheckoutSession } from "@/lib/stripe/actions";
+type PaymentStatus =
+  | "requires_payment_method" | "requires_confirmation" | "requires_action"
+  | "processing" | "succeeded" | "canceled"
+  | "failed"; // requires_payment_method after a failed attempt
 
-const result = await createCheckoutSession({
-  amount: 2000, // $20.00, in cents
-  currency: "usd",
-  productName: "Pro plan — one time",
-  successUrl: "https://yourdomain.com/success",
-  cancelUrl: "https://yourdomain.com/cancel",
-});
+interface CreateCheckoutSessionParams {
+  amount: number; currency: string;
+  productName: string; productDescription?: string;
+  successUrl: string; cancelUrl: string;
+  metadata?: Record<string, string>; customerEmail?: string;
+}
 
-if (result.success) {
-  // result.data.url — redirect the user here, or:
-  // result.data.sessionId — pass to redirectToCheckout() client-side
+interface CreatePaymentIntentParams {
+  amount: number; currency: string;
+  metadata?: Record<string, string>; customerEmail?: string;
+  automaticPaymentMethods?: boolean; // default true
+}
+
+interface RefundParams {
+  paymentIntentId: string;
+  amount?: number; // omit = full refund
+  reason?: "duplicate" | "fraudulent" | "requested_by_customer";
+}
+
+interface PaymentSummary {
+  id: string; status: PaymentStatus; amount: number; currency: string;
+  created: number; customerEmail?: string | null; metadata: Record<string, string>;
+}
+
+interface RefundSummary {
+  id: string; amount: number; status: string | null;
+  reason: string | null; paymentIntentId: string;
+}
+
+interface PaymentMethodSummary {
+  id: string; type: string;
+  card?: { brand: string; last4: string; expMonth: number; expYear: number };
 }
 ```
 
-Client side, if you'd rather redirect from the browser with the session id:
+## Examples
+
+### Hosted Checkout
 
 ```ts
-"use client";
-import { redirectToCheckout } from "@/lib/stripe/client";
+"use server";
+import { redirect } from "next/navigation";
+import { createCheckoutSession } from "@/lib/payments/stripe/one-time/actions";
 
-await redirectToCheckout(sessionId);
+export async function buy() {
+  const result = await createCheckoutSession({
+    amount: 2000, // $20.00
+    currency: "usd",
+    productName: "Lifetime license",
+    successUrl: "https://example.com/success",
+    cancelUrl: "https://example.com/cancel",
+    metadata: { orderId: "ord_123" },
+  });
+
+  if (!result.success || !result.data.url) {
+    return { error: result.success ? "No checkout URL." : result.error };
+  }
+  redirect(result.data.url);
+}
 ```
 
-### Custom payment form (embedded, using Stripe Elements)
-
-Server side:
+### Custom payment form (PaymentIntent + Stripe Elements)
 
 ```ts
-import { createPaymentIntent } from "@/lib/stripe/actions";
+// Server
+import { createPaymentIntent } from "@/lib/payments/stripe/one-time/actions";
 
 const result = await createPaymentIntent({ amount: 2000, currency: "usd" });
-// result.data.clientSecret — pass to your Elements form
+// result.data.clientSecret → pass it to your Elements form
 ```
 
-Client side, after collecting card details with Stripe Elements:
-
 ```ts
+// Client, after Elements produced a paymentMethodId
 "use client";
-import { confirmCardPayment } from "@/lib/stripe/client";
+import { confirmCardPayment } from "@/lib/payments/stripe/one-time/client";
 
-await confirmCardPayment(clientSecret, paymentMethodId);
+const result = await confirmCardPayment(clientSecret, paymentMethodId);
+if (!result.success) showError(result.error);
+else if (result.data.status === "succeeded") showSuccess();
 ```
 
-### Checking status
+### Payment status
 
 ```ts
-import { getPayment, getPaymentStatus } from "@/lib/stripe/actions";
+import { getPayment, getPaymentStatus } from "@/lib/payments/stripe/one-time/actions";
 
 const status = await getPaymentStatus(paymentIntentId);
-const full = await getPayment(paymentIntentId);
+if (status.success && status.data === "failed") { /* show failure UI */ }
+
+const payment = await getPayment(paymentIntentId);
 ```
 
-### Cancel / refund
+### Cancel and refund
 
 ```ts
-import { cancelPayment, refundPayment } from "@/lib/stripe/actions";
+import { cancelPayment, refundPayment } from "@/lib/payments/stripe/one-time/actions";
 
-await cancelPayment(paymentIntentId);
-
-await refundPayment({ paymentIntentId }); // full refund
-await refundPayment({ paymentIntentId, amount: 500 }); // partial, $5.00
+await cancelPayment(paymentIntentId);                         // not yet completed
+await refundPayment({ paymentIntentId });                     // full refund
+await refundPayment({ paymentIntentId, amount: 500 });        // partial refund, $5.00
 ```
 
-### Payment methods
+### Saved cards
 
 ```ts
-import { listPaymentMethods } from "@/lib/stripe/actions";
+import { listPaymentMethods } from "@/lib/payments/stripe/one-time/actions";
 
 const methods = await listPaymentMethods(stripeCustomerId);
 ```
-
-## Error handling
-
-Every `actions.ts` and `client.ts` function returns:
-
-```ts
-{ success: true, data: T } | { success: false, error: string }
-```
-
-Always check `result.success` before reading `result.data` — nothing throws
-across the module boundary, so you never need a try/catch around these calls.
-
-## Notes
-
-- `service.ts` is the only file that imports the `stripe` package or reads
-  `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`. Keep it that way — it's what
-  makes the secret key impossible to leak into a Client Component by accident.
-- Success/cancel pages (`successUrl`/`cancelUrl`) aren't included here — this
-  module only produces the data and URLs; point them at your existing
-  checkout success/cancel pages.

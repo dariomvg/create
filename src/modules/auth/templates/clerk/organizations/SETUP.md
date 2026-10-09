@@ -1,109 +1,202 @@
-# Organizations/Teams module — Clerk (Next.js 16 / App Router)
+# Auth — Clerk — organizations
 
-Separate module from the auth module. Custom roles/permissions live in your other, separate module — this one only uses Clerk's native org roles (`org:admin` / `org:member`).
+## Description
+
+Organizations/Teams with Clerk (`@clerk/nextjs` v7, Core 3) for Next.js 16 App Router: create, get, update and delete organizations; list the user's organizations; invite users; accept and revoke invitations; list, update and remove members; switch the active organization; multi-tenancy through the active organization (`orgId` / `orgSlug`); organization-based protection.
+
+Roles used: Clerk's native `org:admin` (the Owner equivalent) and `org:member`.
+
+Invitations: the invitee accepts client-side (`accept()` through `useOrganizationList`); an admin cancels a pending invitation server-side (`revokeInvitationAction`).
+
+Requires in the Clerk Dashboard (no code):
+- Organizations enabled (Dashboard → Organizations settings).
+- Membership mode: `Membership required` (B2B, users go through a "choose organization" step after sign-in) or `Membership optional` (personal accounts + organizations).
+- Creator role: role assigned to whoever creates an organization (default `org:admin`).
+- Optional member cap per organization (`maxAllowedMemberships`).
+
+Protection model: call `requireOrganization()` or `requireOrgRole(role)` (from `service.ts`) at the top of any Server Component, Server Action or Route Handler. Do not gate by path in `proxy.ts` (`createRouteMatcher()` is deprecated).
 
 ## Dependencies
 
-- `@clerk/nextjs` (already installed for the auth module — nothing new)
+- `next` (16+)
+- `react`
+- `@clerk/nextjs` (v7+)
+- `server-only`
 
-## File map
+## Environment variables
+
+| Variable | Example | Notes |
+|---|---|---|
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | `pk_test_...` | Clerk Dashboard → API Keys |
+| `CLERK_SECRET_KEY` | `sk_test_...` | Clerk Dashboard → API Keys. Server only |
+
+## File structure
 
 ```
-lib/organizations/
-├── service.ts   # Server-only logic. Don't touch.
-├── actions.ts   # Server Actions for Server Components ("use server")
-├── types.ts     # OrgSummary, OrgMember, OrgInvitation, OrgRole
-└── client.ts    # Client component/hook re-exports + copy-paste examples
+@/lib/auth/clerk/organizations/
+├── service.ts   # Server-only logic. Do not edit.
+├── actions.ts   # Server Actions ("use server")
+├── types.ts     # OrgSummary, OrgMember, OrgInvitation, OrgRole, AuthResult<T>
+├── client.ts    # Client component/hook re-exports + usage examples
+└── SETUP.md
+
+.env.local       # project root
 ```
 
-No new `.env.local` (same Clerk instance/keys as the auth module) and no new `proxy.ts` (Next.js only allows one middleware file — see "Route protection" below).
+## Public API
 
-| I need to...                                | Go to |
-|-----------------------------------------------|-------|
-| Create/update/delete an organization           | `lib/organizations/service.ts` |
-| Call org actions from a Server Component (form, button) | `lib/organizations/actions.ts` |
-| Add a type for something org-related           | `lib/organizations/types.ts` |
-| Render `<OrganizationSwitcher/>`, switch active org, accept invitations | `lib/organizations/client.ts` |
-| Show/hide UI by org role or permission         | `lib/clerk/client.ts` → `Show` (auth module, not duplicated here) |
+### `actions.ts` — Server Actions
 
-## Prerequisite: enable Organizations
+Import: `@/lib/auth/clerk/organizations/actions`. All return `AuthResult<T>`.
 
-Nothing here works until you do this in the Dashboard:
+| Export | Arguments | Returns |
+|---|---|---|
+| `createOrganizationAction` | `name: string` | `Promise<AuthResult<OrgSummary>>` — current user becomes the creator |
+| `getOrganizationAction` | `organizationId: string` | `Promise<AuthResult<OrgSummary>>` |
+| `updateOrganizationAction` | `organizationId: string`, `data: { name?: string; slug?: string }` | `Promise<AuthResult<OrgSummary>>` |
+| `deleteOrganizationAction` | `organizationId: string` | `Promise<AuthResult>` |
+| `listUserOrganizationsAction` | none | `Promise<AuthResult<OrgSummary[]>>` — organizations of the current user |
+| `listMembersAction` | `organizationId: string` | `Promise<AuthResult<OrgMember[]>>` |
+| `updateMemberRoleAction` | `organizationId: string`, `userId: string`, `role: OrgRole` | `Promise<AuthResult>` |
+| `removeMemberAction` | `organizationId: string`, `userId: string` | `Promise<AuthResult>` |
+| `inviteMemberAction` | `organizationId: string`, `emailAddress: string`, `role: OrgRole` | `Promise<AuthResult<OrgInvitation>>` — requires `org:sys_memberships:manage` |
+| `listInvitationsAction` | `organizationId: string` | `Promise<AuthResult<OrgInvitation[]>>` |
+| `revokeInvitationAction` | `organizationId: string`, `invitationId: string` | `Promise<AuthResult>` — cancels a pending invitation |
 
-1. **Dashboard → Organizations settings → Enable Organizations.**
-2. Pick the **Membership mode**:
-   - `Membership required` — B2B only, no personal accounts, users are routed through a "choose organization" screen after sign-in.
-   - `Membership optional` — personal accounts stay available alongside orgs (B2C + B2B).
-3. **Creator role** — which role a user gets automatically when they create an org. Defaults to `org:admin` (there's no separate "Owner" role — see below).
+### `client.ts` — Client components and hooks
 
-## Clerk Dashboard checklist (no code needed)
+Import: `@/lib/auth/clerk/organizations/client`. Re-exports from `@clerk/nextjs`.
 
-- [ ] Organizations enabled + Membership mode chosen
-- [ ] Creator role confirmed (default `org:admin`)
-- [ ] Member cap (`maxAllowedMemberships`) set, if you want a hard limit — can also be passed per-org in `createOrganization()`
-- [ ] Custom roles beyond `admin`/`member` — **not here**, that's your separate roles/permissions module
-- [ ] Verified domains / Enterprise SSO — not covered by this module
+| Export | Arguments | Returns |
+|---|---|---|
+| `OrganizationSwitcher` | optional Clerk props (e.g. `hidePersonal`) | UI to create, list and switch organizations |
+| `useOrganization` | none | `{ isLoaded, organization, membership, ... }` for the active organization |
+| `useOrganizationList` | optional `{ userInvitations?, userMemberships? }` | `{ isLoaded, setActive, userInvitations, userMemberships, ... }` |
+| `Show` | `{ when: { role: string } \| { permission: string }, children, fallback? }` | Renders `children` when the active-organization role/permission matches |
 
-## About roles: Owner = Admin
+Switch the active organization: `setActive({ organization: orgId })`. Accept an invitation: `invitation.accept()` on each item of `userInvitations.data`.
 
-Clerk ships two system roles: `org:admin` and `org:member`. `org:admin` is used as the Owner equivalent throughout this module — no custom role.
+### Types (`types.ts`)
 
-## About "reject invitation"
-
-Clerk's API only offers:
-- `accept()` — client-side, called by the invitee on their pending `UserOrganizationInvitation`
-- `revoke()` — server-side, called by an admin to cancel a pending invitation
-
-`revokeInvitationAction` in this module covers that.
-
-## Route protection
-
-Organization-level protection happens entirely at the Server Component/Server Action/Route Handler level, same pattern as `requireUser()` in the auth module — there's no middleware-level alternative to fall back to: Clerk deprecated `createRouteMatcher()` and no longer recommends gating routes (by path or by role) in `proxy.ts`.
-
-```tsx
-import { requireOrganization, requireOrgRole } from "@/lib/organizations/service";
-
-export default async function OrgSettingsPage() {
-  const org = await requireOrgRole("org:admin"); // redirects if no active org or not admin
-  return <p>Settings for {org.name}</p>;
+```ts
+type OrgRole = "org:admin" | "org:member";
+interface OrgSummary {
+  id: string; name: string; slug: string | null;
+  imageUrl: string; membersCount: number; createdAt: Date;
 }
+interface OrgMember {
+  userId: string; organizationId: string; role: OrgRole;
+  identifier: string; imageUrl: string;
+}
+interface OrgInvitation {
+  id: string; organizationId: string; emailAddress: string;
+  role: OrgRole; status: "pending" | "accepted" | "revoked"; createdAt: Date;
+}
+type AuthResult<T = void> =
+  | { success: true; data: T }
+  | { success: false; error: string };
 ```
 
-## Usage examples
+## Examples
 
-**List the user's organizations and let them switch:**
+**Switcher UI:**
 
 ```tsx
-import { OrganizationSwitcher } from "@/lib/organizations/client";
+import { OrganizationSwitcher } from "@/lib/auth/clerk/organizations/client";
 
 <OrganizationSwitcher hidePersonal />
 ```
 
-**Invite a member from a Server Action:**
+**Create an organization from a Server Action:**
 
 ```tsx
-import { inviteMemberAction } from "@/lib/organizations/actions";
+import { createOrganizationAction } from "@/lib/auth/clerk/organizations/actions";
 
-<form action={() => inviteMemberAction(orgId, email, "org:member")}>
-  ...
+<form
+  action={async (formData: FormData) => {
+    "use server";
+    await createOrganizationAction(String(formData.get("name")));
+  }}
+>
+  <input name="name" />
+  <button type="submit">Create</button>
 </form>
 ```
 
-**Accept a pending invitation (client-side, the invitee's own list):**
+**List members in a Server Component:**
+
+```tsx
+import { listMembersAction } from "@/lib/auth/clerk/organizations/actions";
+
+export default async function MembersPage({ params }: { params: Promise<{ orgId: string }> }) {
+  const { orgId } = await params;
+  const result = await listMembersAction(orgId);
+  if (!result.success) return null;
+  return <ul>{result.data.map((m) => <li key={m.userId}>{m.identifier} — {m.role}</li>)}</ul>;
+}
+```
+
+**Invite a member:**
+
+```tsx
+import { inviteMemberAction } from "@/lib/auth/clerk/organizations/actions";
+
+<form
+  action={async (formData: FormData) => {
+    "use server";
+    await inviteMemberAction(orgId, String(formData.get("email")), "org:member");
+  }}
+>
+  <input name="email" type="email" />
+  <button type="submit">Invite</button>
+</form>
+```
+
+**Accept pending invitations (invitee, Client Component):**
 
 ```tsx
 "use client";
-import { useOrganizationList } from "@/lib/organizations/client";
+import { useOrganizationList } from "@/lib/auth/clerk/organizations/client";
 
-const { userInvitations } = useOrganizationList({
-  userInvitations: { infinite: true },
-});
+export function PendingInvitations() {
+  const { userInvitations } = useOrganizationList({ userInvitations: { infinite: true } });
+  return (
+    <>
+      {userInvitations.data?.map((invitation) => (
+        <button key={invitation.id} onClick={() => invitation.accept()}>Accept</button>
+      ))}
+    </>
+  );
+}
 ```
 
-**Gate a section by role or permission:**
+**Switch the active organization (Client Component):**
 
 ```tsx
-import { Show } from "@/lib/clerk/client";
+"use client";
+import { useOrganizationList } from "@/lib/auth/clerk/organizations/client";
+
+export function SwitchTo({ orgId }: { orgId: string }) {
+  const { setActive } = useOrganizationList();
+  return <button onClick={() => setActive?.({ organization: orgId })}>Switch</button>;
+}
+```
+
+**Protect a page by active organization and role** (`requireOrgRole` lives in `service.ts`; returns `OrgSummary`):
+
+```tsx
+import { requireOrgRole } from "@/lib/auth/clerk/organizations/service";
+
+export default async function OrgSettingsPage() {
+  const org = await requireOrgRole("org:admin");
+  return <p>Settings for {org.name}</p>;
+}
+```
+
+**Show UI by role:**
+
+```tsx
+import { Show } from "@/lib/auth/clerk/organizations/client";
 
 <Show when={{ role: "org:admin" }}>
   <AdminPanel />

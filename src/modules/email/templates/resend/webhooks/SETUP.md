@@ -1,49 +1,92 @@
-# Resend Webhooks Module
+# Email — Resend — Webhooks
 
-Handles Resend webhook events for Next.js App Router. Independent from the other email modules.
+Receives Resend delivery events at a single route handler, verifies the signature, and dispatches each event to its own handler function where you add your logic. Handled events: `email.sent`, `email.delivered`, `email.bounced`, `email.failed`, `email.opened`, `email.clicked`.
 
 ## Dependencies
 
-- `svix` (used to verify the webhook signature — this is what Resend itself uses to sign webhook payloads)
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `types.ts` | Event type and payload shape |
-| `service.ts` | Internal logic — verifies and parses the incoming payload. Do not import this directly. |
-| `actions.ts` | One handler function per event — edit these to add your own logic |
-| `route.ts` | Thin entry point — verifies the signature and dispatches to `actions.ts`. Place at `app/api/webhooks/resend/route.ts` |
-| `.env.local` | Environment variables |
-
-## Architecture
-
-`route.ts` never contains business logic — it only verifies the request and calls the matching function in `actions.ts`. This keeps event handling editable in one place (`actions.ts`) without touching signature verification.
-
-```
-Resend → route.ts (verify + dispatch) → actions.ts (your logic per event)
-```
+- `svix`
 
 ## Environment variables
 
+| Variable | Description |
+|---|---|
+| `RESEND_WEBHOOK_SECRET` | Signing secret of the webhook endpoint, from the Resend dashboard |
+
+## File structure
+
 ```
-RESEND_WEBHOOK_SECRET=
+@/lib/email/resend/webhooks/
+├── actions.ts   # one handler per event — edit these
+├── service.ts   # internal logic (signature verification)
+└── types.ts     # event types
 ```
 
-## Configuration (dashboard steps)
+Other files:
 
-1. In the Resend dashboard, go to **Webhooks** → **Add Webhook**.
-2. Set the endpoint URL to `https://yourdomain.com/api/webhooks/resend`.
-3. Select the events: `email.sent`, `email.delivered`, `email.bounced`, `email.failed`, `email.opened`, `email.clicked`.
-4. Copy the **Signing Secret** into `RESEND_WEBHOOK_SECRET`.
+| Path | Purpose |
+|---|---|
+| `app/api/webhooks/resend/route.ts` | Webhook endpoint. Verifies the signature and calls the matching handler in `actions.ts`. Imports from `@/lib/email/resend/webhooks/*` |
+| `.env.local` (project root) | `RESEND_WEBHOOK_SECRET` |
 
-## Usage
+Flow: `Resend → route.ts (verify + dispatch) → actions.ts (your logic)`.
 
-Edit the handler for the event you care about in `actions.ts`:
+## Public API
+
+### Route handler
+
+`app/api/webhooks/resend/route.ts`
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | `request: NextRequest` — raw JSON body plus the `svix-id`, `svix-timestamp` and `svix-signature` headers sent by Resend | `200` `{ received: true }` when the event was verified (events outside the six handled types are acknowledged and ignored); `401` `{ error: "Invalid signature" }` when verification fails |
+
+If a handler in `actions.ts` throws, the route responds with an error status and Resend retries the delivery.
+
+### Event handlers
+
+`@/lib/email/resend/webhooks/actions` — plain server-side async functions called only by `route.ts` (no `"use server"`; do not import them into Client Components). Each ships as an empty stub for you to fill in.
+
+| Export | Triggered by | Arguments | Returns |
+|---|---|---|---|
+| `onEmailSent` | `email.sent` | `event: ResendWebhookEvent` | `Promise<void>` |
+| `onEmailDelivered` | `email.delivered` | `event: ResendWebhookEvent` | `Promise<void>` |
+| `onEmailBounced` | `email.bounced` | `event: ResendWebhookEvent` | `Promise<void>` |
+| `onEmailFailed` | `email.failed` | `event: ResendWebhookEvent` | `Promise<void>` |
+| `onEmailOpened` | `email.opened` | `event: ResendWebhookEvent` | `Promise<void>` |
+| `onEmailClicked` | `email.clicked` | `event: ResendWebhookEvent` | `Promise<void>` |
+
+### Event shape
 
 ```ts
+interface ResendWebhookEvent {
+  type: "email.sent" | "email.delivered" | "email.bounced" | "email.failed" | "email.opened" | "email.clicked";
+  created_at: string;
+  data: {
+    email_id: string;
+    from: string;
+    to: string[];
+    subject: string;
+    [key: string]: unknown; // extra fields vary by event type
+  };
+}
+```
+
+## Configuration
+
+1. In the [Resend dashboard](https://resend.com), go to **Webhooks** → **Add Webhook**.
+2. Set the endpoint URL to `https://<your-domain>/api/webhooks/resend`.
+3. Select the events: `email.sent`, `email.delivered`, `email.bounced`, `email.failed`, `email.opened`, `email.clicked`.
+4. Copy the endpoint's **Signing Secret** into `RESEND_WEBHOOK_SECRET`.
+5. For local development, expose your dev server with a tunnel (e.g. ngrok) and use the tunnel URL as the endpoint.
+6. Opened and clicked events are only reported for emails sent from a domain with open/click tracking enabled in Resend's domain settings.
+
+## Examples
+
+Mark an address as invalid when it bounces:
+
+```ts
+// @/lib/email/resend/webhooks/actions.ts
 export async function onEmailBounced(event: ResendWebhookEvent) {
-  // e.g. mark the recipient's address as invalid in your database
   await db.user.update({
     where: { email: event.data.to[0] },
     data: { emailValid: false },
@@ -51,4 +94,13 @@ export async function onEmailBounced(event: ResendWebhookEvent) {
 }
 ```
 
-No other file needs to change — `route.ts` will call it automatically when the matching event arrives.
+Record a delivery:
+
+```ts
+export async function onEmailDelivered(event: ResendWebhookEvent) {
+  await db.emailLog.update({
+    where: { resendId: event.data.email_id },
+    data: { status: "delivered" },
+  });
+}
+```

@@ -1,171 +1,203 @@
-# Stripe Subscriptions — Setup
+# Stripe — Subscriptions
 
-Self-contained module for recurring payments: create, read, cancel, pause,
-resume, change plan, change quantity, trials, status, renewal, and
-expiration.
+## Description
 
-Separate from `lib/stripe/` (one-time payments) and `lib/stripe-billing/`
-(customer portal, invoices, payment methods) — no shared code, no shared
-webhook endpoint. All three wrap the same Stripe account but keep their
-concerns independent.
+Recurring payments with Stripe for a Next.js App Router project: create subscriptions (with optional trial), read them and their status, cancel, pause, resume, change plan (upgrade/downgrade), change quantity, read renewal and expiration info, and a webhook endpoint for subscription lifecycle events.
 
-**Assumption:** this module operates on an existing `priceId` (created in
-the Stripe Dashboard, or by whatever else manages your product catalog).
-It does not create Products or Prices.
+It operates on existing Stripe objects: a `customerId` and a recurring `priceId` that you already have.
+
+Every function returns a serializable `ActionResult<T>` and never throws across the module boundary. Timestamps are Unix seconds.
+
+```ts
+type ActionResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string };
+```
 
 ## Dependencies
 
-- [`stripe`](https://www.npmjs.com/package/stripe) — server-side SDK, used in `lib/stripe-subscriptions/service.ts`
-- [`@stripe/stripe-js`](https://www.npmjs.com/package/@stripe/stripe-js) — client-side SDK, used in `lib/stripe-subscriptions/client.ts`
+| Package | Used by |
+|---|---|
+| `stripe` | `service.ts` (server SDK) |
+| `@stripe/stripe-js` | `client.ts` (browser SDK) |
 
-Not installed automatically. If you already installed them for the other
-modules, you're covered — same packages.
+## Environment variables
 
-## File map
+| Variable | Scope | Purpose |
+|---|---|---|
+| `STRIPE_SECRET_KEY` | Server | Stripe API secret key. |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Client | Stripe publishable key, used by `client.ts`. |
+| `STRIPE_SUBSCRIPTIONS_WEBHOOK_SECRET` | Server | Signing secret of the Stripe webhook endpoint pointing to `/api/webhooks/stripe-subscriptions`. |
+
+## File structure
 
 ```
-lib/stripe-subscriptions/
-├── service.ts   # Internal logic + Stripe SDK instance. Don't touch/import directly elsewhere.
-├── actions.ts   # Server Actions — import into Server Components.
-├── types.ts     # Shared types — safe to import anywhere.
-└── client.ts    # Client-side helpers — import into Client Components.
+lib/payments/stripe/subscriptions/
+├── actions.ts   # Server Actions — import from Server Components / server code
+├── client.ts    # Browser helpers — import from Client Components
+├── types.ts     # Shared types — safe to import anywhere
+└── service.ts   # Internal Stripe logic — never import it from outside this folder
 
 app/api/webhooks/stripe-subscriptions/
-└── route.ts     # Subscriptions webhook endpoint. Register this URL in your Stripe Dashboard.
-
-.env.local       # Adds STRIPE_SUBSCRIPTIONS_WEBHOOK_SECRET (reuses
-                 # STRIPE_SECRET_KEY and NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
-                 # if already set up for the other modules).
+└── route.ts     # Webhook endpoint (POST)
 ```
 
-## 1. Environment variables
+Import alias: `@/lib/payments/stripe/subscriptions/<file>`.
 
-`STRIPE_SECRET_KEY` and `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` are shared
-across all three Stripe modules — set them once. Add on top:
+Webhook event handling lives in `service.ts` → `stripeSubscriptionsService.handleWebhookEvent` (logs only by default). Your app's sync logic for each event goes there.
 
-| Variable | Where to get it |
-|---|---|
-| `STRIPE_SUBSCRIPTIONS_WEBHOOK_SECRET` | Dashboard → Developers → Webhooks (create a **third**, separate endpoint) |
+## Public API
 
-## 2. Webhooks
+### `actions.ts` (server)
 
-Add a **separate** endpoint in the Stripe Dashboard pointing to:
+| Export | Arguments | Returns |
+|---|---|---|
+| `createSubscription` | `params: CreateSubscriptionParams` (`trialPeriodDays` starts a trial) | `ActionResult<SubscriptionSummary>` — if `clientSecret` is non-null, confirm it client-side |
+| `getSubscription` | `subscriptionId: string` | `ActionResult<SubscriptionSummary>` |
+| `getSubscriptionStatus` | `subscriptionId: string` | `ActionResult<SubscriptionStatus>` |
+| `cancelSubscription` | `params: CancelSubscriptionParams` (`atPeriodEnd: true` cancels at period end, otherwise immediately) | `ActionResult<SubscriptionSummary>` |
+| `pauseSubscription` | `subscriptionId: string` (stops invoicing, voids what would be billed) | `ActionResult<SubscriptionSummary>` |
+| `resumeSubscription` | `subscriptionId: string` | `ActionResult<SubscriptionSummary>` |
+| `changeSubscriptionPlan` | `params: ChangePlanParams` (same call for upgrade, downgrade and plan change) | `ActionResult<SubscriptionSummary>` |
+| `changeSubscriptionQuantity` | `params: ChangeQuantityParams` (`quantity >= 1`) | `ActionResult<SubscriptionSummary>` |
+| `getRenewalInfo` | `subscriptionId: string` | `ActionResult<RenewalInfo>` |
+| `getExpirationInfo` | `subscriptionId: string` | `ActionResult<ExpirationInfo>` |
+| `handleStripeSubscriptionsWebhook` | `rawBody: string, signature: string` | `ActionResult<{ received: true }>` |
 
-```
-https://yourdomain.com/api/webhooks/stripe-subscriptions
-```
+Validation: id arguments must be non-empty; `createSubscription` requires `customerId` and `priceId`; `changeSubscriptionPlan` requires `subscriptionId` and `newPriceId`.
 
-Subscribe it to at least:
+### `client.ts` (browser)
 
-- `customer.subscription.created`
-- `customer.subscription.updated`
-- `customer.subscription.deleted` — your real "expiration" signal
-- `customer.subscription.trial_will_end`
-- `customer.subscription.paused`
-- `customer.subscription.resumed`
-- `invoice.paid` — your real "renewal" signal for recurring charges
-- `invoice.payment_failed`
+| Export | Arguments | Returns |
+|---|---|---|
+| `confirmSubscriptionPayment` | `clientSecret: string, paymentMethodId: string` | `Promise<ActionResult<{ status: string }>>` |
+| `getStripe` | none | `Promise<Stripe \| null>` — shared Stripe.js instance, for Elements |
 
-For local testing:
+### `app/api/webhooks/stripe-subscriptions/route.ts`
 
-```
-stripe listen --forward-to localhost:3000/api/webhooks/stripe-subscriptions
-```
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | `request: Request` (needs the `stripe-signature` header; reads the raw body) | `200 { received: true }` · `400 { error: string }` |
 
-Business logic for what happens on each event goes inside
-`stripeSubscriptionsService.handleWebhookEvent` in `service.ts` — the one
-part of that file meant to be extended as your app grows.
+Events handled: `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted` (expiration), `customer.subscription.trial_will_end`, `customer.subscription.paused`, `customer.subscription.resumed`, `invoice.paid` (renewal), `invoice.payment_failed`.
 
-## 3. Usage
-
-### Create a subscription (with or without a trial)
+### Key types (`types.ts`)
 
 ```ts
-import { createSubscription } from "@/lib/stripe-subscriptions/actions";
+type SubscriptionStatus = Stripe.Subscription.Status;
+// "incomplete" | "incomplete_expired" | "trialing" | "active"
+// | "past_due" | "canceled" | "unpaid" | "paused"
 
-const result = await createSubscription({
-  customerId,
-  priceId,
-  trialPeriodDays: 14, // omit for no trial
-});
+type ProrationBehavior = "create_prorations" | "none" | "always_invoice";
 
-if (result.success && result.data.clientSecret) {
-  // No trial (or a card needing 3D Secure): confirm the first charge client-side.
+interface CreateSubscriptionParams {
+  customerId: string; priceId: string;
+  quantity?: number;          // default 1
+  trialPeriodDays?: number;   // omit = no trial
+  metadata?: Record<string, string>;
+}
+
+interface CancelSubscriptionParams { subscriptionId: string; atPeriodEnd?: boolean }
+
+interface ChangePlanParams {
+  subscriptionId: string; newPriceId: string;
+  prorationBehavior?: ProrationBehavior; // default "create_prorations"
+}
+
+interface ChangeQuantityParams {
+  subscriptionId: string; quantity: number;
+  prorationBehavior?: ProrationBehavior; // default "create_prorations"
+}
+
+interface SubscriptionSummary {
+  id: string; status: SubscriptionStatus; customerId: string;
+  priceId: string; quantity: number;
+  currentPeriodStart: number; currentPeriodEnd: number;
+  cancelAtPeriodEnd: boolean; trialEnd: number | null;
+  clientSecret: string | null; // first-invoice PaymentIntent secret, when confirmation is needed
+}
+
+interface RenewalInfo {
+  willRenew: boolean; currentPeriodEnd: number; nextPaymentAttempt: number | null;
+}
+
+interface ExpirationInfo {
+  cancelAtPeriodEnd: boolean; expiresAt: number | null; status: SubscriptionStatus;
 }
 ```
 
-Client side, only when `clientSecret` is non-null:
+## Examples
+
+### Create a subscription
 
 ```ts
-"use client";
-import { confirmSubscriptionPayment } from "@/lib/stripe-subscriptions/client";
+// Server
+import { createSubscription } from "@/lib/payments/stripe/subscriptions/actions";
 
-await confirmSubscriptionPayment(clientSecret, paymentMethodId);
+const result = await createSubscription({
+  customerId: "cus_123",
+  priceId: "price_123",
+  trialPeriodDays: 14, // optional
+});
+
+if (result.success) {
+  const { id, status, clientSecret } = result.data;
+  // clientSecret !== null → confirm the first payment in the browser
+  // clientSecret === null and status === "trialing" → nothing to confirm yet
+}
 ```
 
-A subscription created with a trial and no `clientSecret` is already
-`trialing` — nothing to confirm until the trial ends and Stripe bills it
-automatically (handled via the `invoice.paid` / `invoice.payment_failed`
-webhook events).
+```ts
+// Client, after Elements produced a paymentMethodId
+"use client";
+import { confirmSubscriptionPayment } from "@/lib/payments/stripe/subscriptions/client";
 
-### Read subscription / status
+const result = await confirmSubscriptionPayment(clientSecret, paymentMethodId);
+if (!result.success) showError(result.error);
+```
+
+### Read status
 
 ```ts
-import { getSubscription, getSubscriptionStatus } from "@/lib/stripe-subscriptions/actions";
+import { getSubscription, getSubscriptionStatus } from "@/lib/payments/stripe/subscriptions/actions";
 
 const sub = await getSubscription(subscriptionId);
 const status = await getSubscriptionStatus(subscriptionId);
 ```
 
-### Cancel
+### Cancel, pause, resume
 
 ```ts
-import { cancelSubscription } from "@/lib/stripe-subscriptions/actions";
+import {
+  cancelSubscription, pauseSubscription, resumeSubscription,
+} from "@/lib/payments/stripe/subscriptions/actions";
 
-await cancelSubscription({ subscriptionId }); // immediate
-await cancelSubscription({ subscriptionId, atPeriodEnd: true }); // at period end
-```
-
-### Pause / resume
-
-```ts
-import { pauseSubscription, resumeSubscription } from "@/lib/stripe-subscriptions/actions";
-
+await cancelSubscription({ subscriptionId });                       // immediately
+await cancelSubscription({ subscriptionId, atPeriodEnd: true });    // at period end
 await pauseSubscription(subscriptionId);
 await resumeSubscription(subscriptionId);
 ```
 
-### Upgrade / downgrade / change plan
-
-All three are the same operation — swapping the subscription item's price.
-Decide the label ("upgrade" vs "downgrade") in your UI based on the price
-difference; the function itself doesn't care:
+### Change plan and quantity
 
 ```ts
-import { changeSubscriptionPlan } from "@/lib/stripe-subscriptions/actions";
+import {
+  changeSubscriptionPlan, changeSubscriptionQuantity,
+} from "@/lib/payments/stripe/subscriptions/actions";
 
+// Upgrade, downgrade and plan change are the same call; label it in your UI.
+await changeSubscriptionPlan({ subscriptionId, newPriceId: "price_pro" });
 await changeSubscriptionPlan({
-  subscriptionId,
-  newPriceId,
-  prorationBehavior: "create_prorations", // default; see Stripe docs for alternatives
+  subscriptionId, newPriceId: "price_basic", prorationBehavior: "none",
 });
-```
-
-### Change quantity (e.g. seats)
-
-```ts
-import { changeSubscriptionQuantity } from "@/lib/stripe-subscriptions/actions";
 
 await changeSubscriptionQuantity({ subscriptionId, quantity: 5 });
 ```
 
-### Renewal / expiration info
-
-There's no "renew" action in Stripe's API — renewal happens automatically
-via the billing cycle. These two read the current state instead:
+### Renewal and expiration
 
 ```ts
-import { getRenewalInfo, getExpirationInfo } from "@/lib/stripe-subscriptions/actions";
+import { getRenewalInfo, getExpirationInfo } from "@/lib/payments/stripe/subscriptions/actions";
 
 const renewal = await getRenewalInfo(subscriptionId);
 // { willRenew, currentPeriodEnd, nextPaymentAttempt }
@@ -173,28 +205,3 @@ const renewal = await getRenewalInfo(subscriptionId);
 const expiration = await getExpirationInfo(subscriptionId);
 // { cancelAtPeriodEnd, expiresAt, status }
 ```
-
-For the actual renewal/expiration *events* as they happen, listen to
-`invoice.paid` (renewed) and `customer.subscription.deleted` (expired) in
-the webhook handler.
-
-## Error handling
-
-Every `actions.ts` and `client.ts` function returns:
-
-```ts
-{ success: true, data: T } | { success: false, error: string }
-```
-
-Always check `result.success` before reading `result.data` — nothing
-throws across the module boundary.
-
-## Notes
-
-- `service.ts` is the only file that imports the `stripe` package or reads
-  `STRIPE_SECRET_KEY` / `STRIPE_SUBSCRIPTIONS_WEBHOOK_SECRET`.
-- This module doesn't create Products/Prices or Customers — both are
-  assumed to already exist.
-- Pausing uses `pause_collection: { behavior: "void" }` (no invoices are
-  generated while paused, nothing is owed for that time). Check Stripe's
-  docs if you want `mark_uncollectible` or `keep_as_draft` behavior instead.

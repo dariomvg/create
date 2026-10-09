@@ -1,58 +1,121 @@
-# OpenAI Tool Calling — Setup
+# OpenAI Tool Calling
 
-Drop-in tool calling module for Next.js (App Router) using the OpenAI SDK.
-Runs the AI ↔ tool execution loop:
-
-```
-AI → Tool → Database/API → Result → AI
-```
-
-This is a **separate, independent module** — it doesn't import from or
-depend on the Text Generation or Chat modules. It's deliberately agnostic
-about where message history comes from: you pass in whatever messages your
-own chat implementation manages, and get back the model's final reply plus
-a record of every tool it called.
+Tool calling with the OpenAI SDK for Next.js (App Router). Runs the loop AI → Tool → Database/API → Result → AI: you define tools with a JSON Schema and an `execute` function, the model decides which to call (one or several per run), arguments are validated before execution, results are fed back to the model, and the final reply is returned together with a record of every tool call. It takes a plain `{ role, content }[]` message array, so it plugs into any chat implementation.
 
 ## Dependencies
 
-- `openai` — official OpenAI SDK
-- `ajv` — JSON Schema validator, used to validate tool arguments returned by the model before executing them
+- `openai`
+- `ajv`
+- `server-only`
 
 ## Environment variables
 
-See `.env.local`:
-
-- `OPENAI_API_KEY` — required.
+| Variable | Required | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | OpenAI API key. Read on the server only. |
 
 ## File structure
 
 ```
-lib/openai-tools/
-├── types.ts          # Types, default model/token config, rate limit config
-├── tools.ts             # Customize here: define your tools with `defineTool`
-├── service.ts             # Internal — SDK calls, the AI ↔ tool loop, ajv validation, error normalization
-├── actions.ts               # "use server" — single public entrypoint (runWithToolsAction)
-└── .env.local
+lib/ai/openai/tool-calling/
+├── actions.ts   # "use server" — public entrypoint (runWithToolsAction)
+├── tools.ts     # defineTool helper. Define your own tools with it (this is the file you customize)
+├── service.ts   # Internal — the AI ↔ tool loop, ajv validation, error normalization. Never import directly.
+└── types.ts     # Types, defaults (model, tokens, temperature, max round trips) and rate limit config
 ```
 
-## Setup steps
+## Public API
 
-1. Copy the `lib/openai-tools/` folder into your project.
-2. Set `OPENAI_API_KEY` in your project's `.env.local`.
-3. Define your tools (see below) and pass them into `runWithToolsAction` from wherever your chat backend lives.
+### `actions.ts` — `@/lib/ai/openai/tool-calling/actions`
 
-## Usage
+Server-side (also callable from Client Components as a Server Action). Never throws: always check `result.ok`.
 
-### Defining tools
+| Export | Arguments | Returns |
+|---|---|---|
+| `runWithToolsAction` | `options: RunWithToolsOptions` | `Promise<AIActionResult<RunWithToolsResult>>` |
 
-Use `defineTool` from `tools.ts` for parameter/result type inference. Each
-tool needs a JSON Schema for its parameters and an `execute` function that
-does the real work (call your DB/API):
+### `tools.ts` — `@/lib/ai/openai/tool-calling/tools`
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `defineTool<TArgs, TResult>` | `tool: ToolDefinition<TArgs, TResult>` | `ToolDefinition<TArgs, TResult>` — identity helper, only for type inference |
+| `createToolRegistry` | `tools: ToolDefinition[]` | `Map<string, ToolDefinition>` — called internally by each run; throws on duplicate tool names. No need to call it. |
+
+### Types — `@/lib/ai/openai/tool-calling/types`
 
 ```ts
-import { defineTool } from "@/lib/openai-tools/tools";
+interface ToolChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
 
-const getOrderStatus = defineTool({
+interface ToolDefinition<TArgs = Record<string, unknown>, TResult = unknown> {
+  name: string;                        // unique; the model uses it to call the tool
+  description: string;                 // main signal the model uses to decide when to call it
+  parameters: Record<string, unknown>; // JSON Schema (type: "object") for the arguments
+  execute: (args: TArgs) => Promise<TResult>; // your DB/API call. Throw to signal failure.
+}
+
+interface RunWithToolsOptions {
+  messages: ToolChatMessage[];   // include the system prompt here as a { role: "system" } message
+  tools: ToolDefinition[];
+  model?: string;                // default "gpt-4o-mini"
+  temperature?: number;          // default 0.7
+  maxOutputTokens?: number;      // default 1024, capped at 4096
+  maxToolRoundtrips?: number;    // default 5
+}
+
+interface ExecutedToolCall {
+  toolName: string;
+  args: Record<string, unknown>;
+  result: unknown;
+}
+
+interface RunWithToolsResult {
+  text: string;                  // the model's final reply
+  toolCalls: ExecutedToolCall[]; // every tool executed, in order
+  model: string;
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number }; // last model call only
+}
+
+type AIActionResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: AIActionError };
+
+interface AIActionError {
+  code:
+    | "RATE_LIMITED" | "INVALID_REQUEST" | "AUTH_ERROR" | "TIMEOUT"
+    | "TOOL_NOT_FOUND" | "TOOL_VALIDATION_ERROR" | "TOOL_EXECUTION_ERROR"
+    | "UNKNOWN";
+  message: string;      // safe to show in the UI
+  retryable: boolean;
+  retryAfter?: number;  // seconds — only set for RATE_LIMITED
+  toolName?: string;    // set for TOOL_* codes
+}
+```
+
+### Behavior
+
+- **Loop:** each round sends `messages` and the tool schemas to the model. If the model replies with text, the run ends. If it requests tools, they run one at a time in the requested order: lookup by name, parse the JSON arguments, validate them against `parameters` with `ajv`, call `execute`, and send the result back to the model as the tool message.
+- **A tool failure stops the run immediately** and returns `{ ok: false, error }`. The error is not fed back to the model.
+  - `TOOL_NOT_FOUND`: the model requested a tool name that is not in `tools`.
+  - `TOOL_VALIDATION_ERROR`: the arguments were not valid JSON or did not match the schema; `message` lists what failed.
+  - `TOOL_EXECUTION_ERROR`: `execute` threw; `message` is the thrown error's message.
+- **No rollback:** tools that already ran before the failure keep their side effects, and their `toolCalls` are not included in the error result.
+- **Tool results** are sent to the model with `JSON.stringify`, so `execute` must return a JSON-serializable value. Return `undefined` and the request to OpenAI is rejected (`INVALID_REQUEST`); return something like `{ ok: true }` for tools with no data.
+- **Unique names:** two tools with the same `name` make the run fail with `UNKNOWN`.
+- **Round trip limit:** `maxToolRoundtrips` caps how many times the model can request tools. If it is reached while the model still wants tools, the run returns the last text it has, which is often an empty string.
+- **Rate limit:** each model call retries a 429 up to 2 times with exponential backoff. If retries run out, the result is `RATE_LIMITED` with `retryAfter` in seconds (20 by default).
+- **Persistence:** nothing is stored. The caller owns the message history, appends `result.data.text` as the assistant reply, and decides whether to keep `toolCalls`.
+
+## Examples
+
+### Define a tool
+
+```ts
+import { defineTool } from "@/lib/ai/openai/tool-calling/tools";
+
+export const getOrderStatus = defineTool({
   name: "get_order_status",
   description: "Look up the current status of a customer's order by order id",
   parameters: {
@@ -70,74 +133,62 @@ const getOrderStatus = defineTool({
 });
 ```
 
-### Running the loop
+### Run the loop with multiple tools (server)
 
 ```ts
-import { runWithToolsAction } from "@/lib/openai-tools/actions";
+import { runWithToolsAction } from "@/lib/ai/openai/tool-calling/actions";
+import { getOrderStatus } from "./tools/get-order-status";
+import { getRefundPolicy } from "./tools/get-refund-policy";
 
 const result = await runWithToolsAction({
   messages: [
     { role: "system", content: "You are a helpful customer support assistant." },
-    { role: "user", content: "Where's my order #12345?" },
+    { role: "user", content: "Where is order 12345, and can I return it?" },
   ],
-  tools: [getOrderStatus],
+  tools: [getOrderStatus, getRefundPolicy],
+  maxToolRoundtrips: 3,
 });
 
 if (result.ok) {
-  console.log(result.data.text); // model's final reply
-  console.log(result.data.toolCalls); // every tool call executed, with args + result
-} else {
-  console.error(result.error.code, result.error.message, result.error.toolName);
+  console.log(result.data.text);      // final reply
+  console.log(result.data.toolCalls); // [{ toolName, args, result }, ...]
 }
 ```
 
-### Integrating with an external chat
-
-`messages` is intentionally just `{ role, content }[]` — map your chat's own
-message history (e.g. from a database, or from the OpenAI Chat module) into
-that shape before calling `runWithToolsAction`, and append `result.data.text`
-as the assistant's reply using however your chat persists messages.
-
-## Error handling
-
-Same normalized shape as the other modules, with three tool-specific codes:
+### Handle tool errors
 
 ```ts
-interface AIActionError {
-  code:
-    | "RATE_LIMITED"
-    | "INVALID_REQUEST"
-    | "AUTH_ERROR"
-    | "TIMEOUT"
-    | "TOOL_NOT_FOUND"
-    | "TOOL_VALIDATION_ERROR"
-    | "TOOL_EXECUTION_ERROR"
-    | "UNKNOWN";
-  message: string;
-  retryable: boolean;
-  retryAfter?: number; // seconds, only set for RATE_LIMITED
-  toolName?: string; // set for TOOL_* codes
+if (!result.ok) {
+  switch (result.error.code) {
+    case "TOOL_VALIDATION_ERROR":
+    case "TOOL_EXECUTION_ERROR":
+    case "TOOL_NOT_FOUND":
+      console.error(`Tool "${result.error.toolName}" failed: ${result.error.message}`);
+      break;
+    case "RATE_LIMITED":
+      console.log(`Retry in ${result.error.retryAfter}s`);
+      break;
+    default:
+      console.error(result.error.message);
+  }
 }
 ```
 
-- `runWithToolsAction` never throws — it returns `{ ok: false, error }`.
-- **If a tool fails (unknown tool, invalid arguments, or the `execute`
-  function throws), the loop stops immediately** — the error is returned to
-  your app, it is not fed back to the model to let it try recovering on its
-  own. If you want the model to see and react to tool failures instead,
-  you'd need to change the loop in `service.ts` to push the error as the
-  tool's result message instead of throwing.
+### Use it inside an existing chat
 
-## Rate limiting
+```ts
+import { runWithToolsAction } from "@/lib/ai/openai/tool-calling/actions";
 
-Same approach as the other modules: automatic retry on a 429 with
-exponential backoff (see `RATE_LIMIT_CONFIG` in `types.ts`). If retries are
-exhausted, the error surfaces as `RATE_LIMITED` with a `retryAfter` in
-seconds.
+// `history` is whatever your chat stores: map it to { role, content }.
+const messages = [
+  { role: "system" as const, content: "You are a helpful assistant." },
+  ...history.map(({ role, content }) => ({ role, content })),
+  { role: "user" as const, content: newUserMessage },
+];
 
-## Round trip limit
+const result = await runWithToolsAction({ messages, tools: [getOrderStatus] });
 
-`maxToolRoundtrips` (default: `DEFAULT_MAX_TOOL_ROUNDTRIPS` in `types.ts`)
-caps how many times the model can call tools before this module gives up
-and returns whatever text reply it has — this prevents an unbounded loop if
-the model keeps requesting tools indefinitely.
+if (result.ok) {
+  // Save result.data.text as the assistant message with your own persistence.
+}
+```

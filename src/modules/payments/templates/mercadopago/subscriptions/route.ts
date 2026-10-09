@@ -50,7 +50,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid signature." }, { status: 401 });
   }
 
-  if (body.type === "preapproval") {
+  if (body.type === "subscription_preapproval" || body.type === "preapproval") {
     const result = await getPreapproval(dataId);
 
     if (!result.success) {

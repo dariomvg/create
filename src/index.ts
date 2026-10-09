@@ -5,6 +5,7 @@ import { detectProject } from './core/detect-project.js';
 import { detectPackageManager } from './core/detect-package-manager.js';
 import { runMainMenu } from './prompts/main-menu.js';
 import { runProviders } from './core/run-provider.js';
+import { copyAgentDocs } from './core/copy-agent-docs.js';
 import { printSummary } from './core/summary.js';
 
 /**
@@ -41,6 +42,23 @@ async function main(): Promise<void> {
   }
 
   const succeeded = await runProviders(selections, ctx);
+
+  // AGENTS.md / CLAUDE.md / GEMINI.md se copian UNA vez al final (su
+  // contenido no depende de qué se eligió), y solo si al menos una
+  // Selection salió bien — si todo falló, no hay nada que documentar.
+  //
+  // Es un paso accesorio: si falla (ej. un archivo de solo lectura),
+  // solo se avisa y se sigue al resumen. Las integraciones ya quedaron
+  // instaladas y no hay motivo para que esto las deje sin resumen.
+  if (succeeded.length > 0) {
+    try {
+      await copyAgentDocs(ctx);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.warn(`Could not write the AI instruction files: ${message}`);
+    }
+  }
+
   await printSummary(succeeded, ctx);
 }
 

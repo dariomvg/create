@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+ 
+## [0.2.0] - 2026-10-08
+ 
+### Added
+ 
+- AI instruction files: after a successful run, the CLI now copies `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` into the root of your project, so AI assistants and coding agents understand the structure of what was installed.
+- `AGENTS.md` documents the `lib/<module>/<provider>/<feature>` architecture, the full module/feature/provider catalog, the route handlers the CLI creates, and rules for working with the installed code. `CLAUDE.md` and `GEMINI.md` import it instead of duplicating its content.
+- Existing files are never overwritten: if you already have one of these files, the CLI appends its block at the end. Running the CLI again does not duplicate it, and `CLAUDE.md` / `GEMINI.md` are left alone if they already point to `AGENTS.md`.
 
 ## [0.1.2] - 2026-09-19
 

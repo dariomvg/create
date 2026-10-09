@@ -1,45 +1,95 @@
-# Vercel AI SDK — Text Generation Module
+# Vercel AI SDK (Gemini) — Text Generation
 
-A self-contained module for text generation using the [Vercel AI SDK](https://sdk.vercel.ai) with **Google (Gemini)** as the provider. Covers generate text, streaming text, system prompts, temperature/config, and structured output.
+Text generation with the [Vercel AI SDK](https://sdk.vercel.ai) using Google Gemini as the provider. Supports generating text, streaming text, system prompts, user prompts, temperature/config overrides, and structured output validated against a Zod schema.
+
+Every function returns a normalized `AIResult<T>` (never throws), so results can be branched on `success` and errors rendered directly in the UI.
 
 ## Dependencies
 
-This module uses:
+| Package | Used for |
+|---|---|
+| `ai` | `generateText`, `streamText`, `generateObject`, `APICallError` |
+| `@ai-sdk/google` | Gemini provider (`google(modelId)`) |
+| `zod` | Schema for structured output |
 
-- `ai` — the Vercel AI SDK core (`generateText`, `streamText`, `generateObject`, `APICallError`)
-- `@ai-sdk/google` — the Google (Gemini) provider adapter
-- `zod` — used to define schemas for structured output (peer dependency of `generateObject`)
+## Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Yes | Google AI (Gemini) API key. Read automatically by `@ai-sdk/google`. |
 
 ## File structure
 
 ```
-types.ts            Shared types, default model config, rate limit config
-service.ts           Internal logic: calls the AI SDK, normalizes errors — do not modify
-actions.ts            Server Actions — import into Server Components
-client.ts              Client-side streaming helper — import into Client Components
-stream/handler.ts   Internal streaming logic used by the route handler
-stream/route.ts       Route handler — copy to app/api/ai-sdk/stream/route.ts
-.env.local             Environment variable for the Google API key
+lib/ai/vercel-sdk/text-generation/
+├── types.ts            # Types, default model/temperature/max tokens, rate limit config
+├── service.ts          # Internal logic (AI SDK calls, rate limit, error normalization)
+├── actions.ts          # Server Actions — public API for server code
+├── client.ts           # Client-side streaming helper — public API for Client Components
+└── stream/
+    └── handler.ts      # Internal streaming logic used by the route handler
+
+app/api/ai-sdk/stream/
+└── route.ts            # POST route handler for streaming
 ```
 
-## Setup
+`client.ts` calls the route above through its private `STREAM_ENDPOINT` constant (`"/api/ai-sdk/stream"`). If the route is mounted at a different path, update that constant.
 
-1. Copy `stream/route.ts` into your project at:
-   ```
-   app/api/ai-sdk/stream/route.ts
-   ```
-   (its import of `../service` and `../types` will then resolve to this module's `service.ts` / `types.ts` — keep `stream/handler.ts` alongside it, or adjust the relative imports if you place files differently)
+## Public API
 
-2. Add your Google AI API key to `.env.local`. Get one at https://aistudio.google.com/apikey
+Import server functions from `@/lib/ai/vercel-sdk/text-generation/actions` and the client function from `@/lib/ai/vercel-sdk/text-generation/client`. Server Actions can also be called directly from Client Components.
 
-3. Import from `actions.ts` (server) or `client.ts` (client) as shown below.
+| File | Export | Arguments | Returns |
+|---|---|---|---|
+| `actions.ts` | `generateText` | `params: GenerateTextParams` | `Promise<AIResult<GenerateTextResult>>` |
+| `actions.ts` | `generateStructuredOutput<T>` | `params: GenerateStructuredParams<T>` | `Promise<AIResult<GenerateStructuredResult<T>>>` |
+| `client.ts` | `streamText` | `params: StreamTextParams`, `callbacks: StreamTextCallbacks`, `signal?: AbortSignal` | `Promise<void>` — chunks and errors are delivered through `callbacks` |
+| `app/api/ai-sdk/stream/route.ts` | `POST` | JSON body: `StreamTextParams` (`prompt` is required) | Success: streamed `text/plain` response. Failure: JSON `{ error: AIServiceError }` with status `400` (invalid request), `429` (rate limited), `502` (provider error) or `500` |
 
-## Usage
+### Types
+
+Imported from `@/lib/ai/vercel-sdk/text-generation/types`.
+
+**`GenerateTextParams`** / **`StreamTextParams`**
+
+| Field | Type | Default |
+|---|---|---|
+| `prompt` | `string` | required |
+| `system` | `string?` | — |
+| `temperature` | `number?` | `0.7` |
+| `maxTokens` | `number?` | `1024` |
+| `model` | `string?` | `"gemini-1.5-pro"` |
+
+**`GenerateStructuredParams<T>`** — same fields as above, plus `schema: ZodType<T>` (required).
+
+**`GenerateTextResult`** — `{ text: string; finishReason: string; usage: { promptTokens: number; completionTokens: number; totalTokens: number } }`
+
+**`GenerateStructuredResult<T>`** — `{ object: T; finishReason: string; usage: { ... same as above } }`
+
+**`StreamTextCallbacks`** (exported from `client.ts`)
+
+| Callback | Signature | When |
+|---|---|---|
+| `onChunk` | `(chunk: string) => void` | For every received chunk, in order (required) |
+| `onError` | `(error: AIServiceError) => void` | Once, if the request fails before or during streaming |
+| `onFinish` | `() => void` | Once, when the stream completes successfully |
+
+**`AIResult<T>`** — `{ success: true; data: T } | { success: false; error: AIServiceError }`
+
+**`AIServiceError`** — `{ code: "RATE_LIMITED" | "INVALID_REQUEST" | "PROVIDER_ERROR" | "UNKNOWN"; message: string; retryAfter?: number }`. `message` is safe to show in the UI; `retryAfter` (seconds) is only set for `RATE_LIMITED`.
+
+### Behavior notes
+
+- **Rate limiting:** a local in-memory sliding-window limiter (`RATE_LIMIT_CONFIG` in `types.ts`, default 20 requests/minute per server instance) runs before each provider call. A provider-side `429` is normalized to the same `RATE_LIMITED` code, with `retryAfter` when the provider sends a `retry-after` header.
+- **Mid-stream errors:** if the provider fails after streaming has started, the error is embedded as the final piece of streamed text. `streamText` in `client.ts` detects it in the last chunk and delivers it to `onError` instead of `onChunk`.
+- **Structured output** requires a Zod schema; the validated object is returned in `data.object`.
+
+## Examples
 
 ### Generate text (server)
 
 ```ts
-import { generateText } from "@/lib/ai/actions";
+import { generateText } from "@/lib/ai/vercel-sdk/text-generation/actions";
 
 const result = await generateText({
   prompt: "Write a haiku about the ocean",
@@ -50,25 +100,22 @@ const result = await generateText({
 if (result.success) {
   console.log(result.data.text);
 } else {
-  // result.error: { code, message, retryAfter? }
-  console.error(result.error.message);
+  console.error(result.error.code, result.error.message);
 }
 ```
 
 ### Structured output (server)
 
 ```ts
-import { generateStructuredOutput } from "@/lib/ai/actions";
 import { z } from "zod";
-
-const schema = z.object({
-  title: z.string(),
-  tags: z.array(z.string()),
-});
+import { generateStructuredOutput } from "@/lib/ai/vercel-sdk/text-generation/actions";
 
 const result = await generateStructuredOutput({
   prompt: "Summarize this article into a title and tags: ...",
-  schema,
+  schema: z.object({
+    title: z.string(),
+    tags: z.array(z.string()),
+  }),
 });
 
 if (result.success) {
@@ -76,19 +123,19 @@ if (result.success) {
 }
 ```
 
-### Stream text (client)
+### Stream text (Client Component)
 
 ```tsx
 "use client";
 
 import { useState } from "react";
-import { streamText } from "@/lib/ai/client";
+import { streamText } from "@/lib/ai/vercel-sdk/text-generation/client";
 
-export function ChatDemo() {
+export function StreamDemo() {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  async function handleSubmit() {
+  async function handleGenerate() {
     setText("");
     setError(null);
 
@@ -97,41 +144,26 @@ export function ChatDemo() {
       {
         onChunk: (chunk) => setText((prev) => prev + chunk),
         onError: (err) => setError(err.message),
-        onFinish: () => console.log("done"),
       }
     );
   }
 
   return (
     <div>
-      <button onClick={handleSubmit}>Generate</button>
+      <button onClick={handleGenerate}>Generate</button>
       {error ? <p role="alert">{error}</p> : <p>{text}</p>}
     </div>
   );
 }
 ```
 
-## Error handling
-
-Every function returns (or surfaces, in the streaming case) a normalized error shape instead of a raw SDK/provider error:
+### Handle rate limits in the UI
 
 ```ts
-{
-  code: "RATE_LIMITED" | "INVALID_REQUEST" | "PROVIDER_ERROR" | "UNKNOWN",
-  message: string,       // safe to show in the UI
-  retryAfter?: number,   // seconds, only present for RATE_LIMITED
+const result = await generateText({ prompt: "..." });
+
+if (!result.success && result.error.code === "RATE_LIMITED") {
+  // Disable the submit button and show a countdown.
+  const seconds = result.error.retryAfter ?? 60;
 }
 ```
-
-Use `code` to branch UI behavior (e.g. disable the submit button and show a countdown when `retryAfter` is present) and `message` as the user-facing text.
-
-## Rate limiting
-
-Two layers, both surfaced as `RATE_LIMITED` errors:
-
-- **Local guard** (`types.ts` → `RATE_LIMIT_CONFIG`): a simple in-memory sliding-window limiter (default: 20 requests / minute per server instance) that stops requests before they reach the provider. Per-instance only — not shared across multiple server instances.
-- **Provider rate limit**: if Google's API itself returns a 429, it's caught and normalized the same way, including `retryAfter` when the provider supplies a `retry-after` header.
-
-## Known limitation
-
-Mid-stream provider errors are embedded as the final piece of streamed text (the AI SDK's text-stream protocol doesn't support out-of-band error signaling). `client.ts` detects this with a best-effort check on the last received chunk. This is a simplification — if this ever becomes a problem, switching to the AI SDK's data-stream protocol would allow structured error parts, at the cost of extra client-side parsing complexity.

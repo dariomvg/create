@@ -1,194 +1,206 @@
-# Stripe Billing — Setup
+# Stripe — Billing Management
 
-Self-contained module for SaaS-style billing: Customer Portal, invoices,
-payment history, payment methods, upcoming invoice, and billing cycle.
+## Description
 
-This is separate from the one-time payments module (`lib/stripe/`) — no
-shared code, no shared webhook endpoint. Both wrap the same Stripe account,
-but keep their concerns independent.
+SaaS billing management with Stripe for a Next.js App Router project: Customer Portal sessions, invoices (list, detail, status), payment history, saved payment methods, updating the default payment method, upcoming invoice, billing cycle, and a webhook endpoint for billing events.
 
-**Assumption:** this module operates on an existing Stripe `customerId` /
-`subscriptionId` that you already have on hand. It does not create
-customers or subscriptions — that's outside its scope.
+It operates on existing Stripe objects: a `customerId` (and a `subscriptionId` for billing cycle) that you already have.
+
+Every `actions.ts` function returns a serializable `ActionResult<T>` and never throws across the module boundary. Amounts are integers in the smallest currency unit (e.g. cents). Timestamps are Unix seconds.
+
+```ts
+type ActionResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string };
+```
 
 ## Dependencies
 
-- [`stripe`](https://www.npmjs.com/package/stripe) — server-side SDK, used in `lib/stripe-billing/service.ts`
-- [`@stripe/stripe-js`](https://www.npmjs.com/package/@stripe/stripe-js) — client-side SDK, used in `lib/stripe-billing/client.ts`
+| Package | Used by |
+|---|---|
+| `stripe` | `service.ts` (server SDK) |
+| `@stripe/stripe-js` | `client.ts` (browser SDK) |
 
-Not installed automatically — add them with your package manager before
-using the module. If you already installed them for the payments module,
-you're covered — same packages.
+## Environment variables
 
-## File map
+| Variable | Scope | Purpose |
+|---|---|---|
+| `STRIPE_SECRET_KEY` | Server | Stripe API secret key. |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Client | Stripe publishable key, used by `client.ts`. |
+| `STRIPE_BILLING_WEBHOOK_SECRET` | Server | Signing secret of the Stripe webhook endpoint pointing to `/api/webhooks/stripe-billing`. |
+
+## File structure
 
 ```
-lib/stripe-billing/
-├── service.ts   # Internal logic + Stripe SDK instance. Don't touch/import directly elsewhere.
-├── actions.ts   # Server Actions — import into Server Components.
-├── types.ts     # Shared types — safe to import anywhere.
-└── client.ts    # Client-side helpers — import into Client Components.
+lib/payments/stripe/billing-management/
+├── actions.ts   # Server Actions — import from Server Components / server code
+├── client.ts    # Browser helpers — import from Client Components
+├── types.ts     # Shared types — safe to import anywhere
+└── service.ts   # Internal Stripe logic — never import it from outside this folder
 
 app/api/webhooks/stripe-billing/
-└── route.ts     # Billing webhook endpoint. Register this URL in your Stripe Dashboard.
-
-.env.local       # Adds STRIPE_BILLING_WEBHOOK_SECRET (reuses STRIPE_SECRET_KEY
-                 # and NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY if you already set
-                 # those up for the payments module).
+└── route.ts     # Webhook endpoint (POST)
 ```
 
-## 1. Environment variables
+Import alias: `@/lib/payments/stripe/billing-management/<file>`.
 
-`STRIPE_SECRET_KEY` and `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` are shared with
-the payments module — set them once. Add on top:
+Webhook event handling lives in `service.ts` → `stripeBillingService.handleWebhookEvent` (logs only by default). Your app's sync logic for each event goes there.
 
-| Variable | Where to get it |
-|---|---|
-| `STRIPE_BILLING_WEBHOOK_SECRET` | Dashboard → Developers → Webhooks (create a **second**, separate endpoint) |
+The Customer Portal must be configured in the Stripe Dashboard (Settings → Billing → Customer portal); `createCustomerPortalSession` opens a session against that configuration.
 
-## 2. Customer Portal
+## Public API
 
-Enable and configure the portal in the Dashboard first:
-**Settings → Billing → Customer portal**. Choose what customers can do
-there (cancel plans, update payment methods, view invoices, etc.) —
-`createCustomerPortalSession` just opens a session against whatever you
-configure there.
+### `actions.ts` (server)
 
-## 3. Webhooks
+| Export | Arguments | Returns |
+|---|---|---|
+| `createCustomerPortalSession` | `params: CreatePortalSessionParams` | `ActionResult<{ url: string }>` |
+| `listInvoices` | `params: ListInvoicesParams` | `ActionResult<InvoiceSummary[]>` |
+| `getInvoice` | `invoiceId: string` | `ActionResult<InvoiceSummary>` |
+| `getInvoiceStatus` | `invoiceId: string` | `ActionResult<InvoiceStatus>` |
+| `listPaymentHistory` | `customerId: string, limit?: number` (default 10; based on charges) | `ActionResult<PaymentHistoryEntry[]>` |
+| `listPaymentMethods` | `customerId: string` (cards only) | `ActionResult<PaymentMethodSummary[]>` — each entry has `isDefault` |
+| `createSetupIntent` | `customerId: string` | `ActionResult<{ clientSecret: string \| null }>` |
+| `setDefaultPaymentMethod` | `customerId: string, paymentMethodId: string` | `ActionResult<{ id: string }>` |
+| `getUpcomingInvoice` | `customerId: string` | `ActionResult<UpcomingInvoiceSummary>` |
+| `getBillingCycle` | `subscriptionId: string` | `ActionResult<BillingCycleSummary>` |
+| `handleStripeBillingWebhook` | `rawBody: string, signature: string` | `ActionResult<{ received: true }>` |
 
-Add a **second, separate** endpoint in the Stripe Dashboard pointing to:
+Validation: id arguments must be non-empty.
 
-```
-https://yourdomain.com/api/webhooks/stripe-billing
-```
+### `client.ts` (browser)
 
-Subscribe it to at least:
+| Export | Arguments | Returns |
+|---|---|---|
+| `redirectToCustomerPortal` | `url: string` (the `url` from `createCustomerPortalSession`) | `void` — navigates via `window.location.href` |
+| `confirmCardSetup` | `clientSecret: string, paymentMethodId: string` | `Promise<ActionResult<{ paymentMethodId: string }>>` |
+| `getStripe` | none | `Promise<Stripe \| null>` — shared Stripe.js instance, for Elements |
 
-- `invoice.paid`
-- `invoice.payment_failed`
-- `invoice.upcoming`
-- `customer.subscription.updated`
-- `customer.subscription.deleted`
-- `payment_method.attached`
-- `payment_method.detached`
+### `app/api/webhooks/stripe-billing/route.ts`
 
-For local testing:
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | `request: Request` (needs the `stripe-signature` header; reads the raw body) | `200 { received: true }` · `400 { error: string }` |
 
-```
-stripe listen --forward-to localhost:3000/api/webhooks/stripe-billing
-```
+Events handled: `invoice.paid`, `invoice.payment_failed`, `invoice.upcoming`, `customer.subscription.updated`, `customer.subscription.deleted`, `payment_method.attached`, `payment_method.detached`.
 
-Business logic for what happens on each event goes inside
-`stripeBillingService.handleWebhookEvent` in `service.ts` — the one part
-of that file meant to be extended as your billing needs grow.
-
-## 4. Usage
-
-### Customer Portal (billing history, invoices, cancel — all Stripe-hosted)
+### Key types (`types.ts`)
 
 ```ts
-import { createCustomerPortalSession } from "@/lib/stripe-billing/actions";
+type InvoiceStatus = "draft" | "open" | "paid" | "uncollectible" | "void";
 
-const result = await createCustomerPortalSession({
-  customerId,
-  returnUrl: "https://yourdomain.com/account/billing",
-});
+interface CreatePortalSessionParams { customerId: string; returnUrl: string }
 
-if (result.success) {
-  // redirect the user to result.data.url
+interface ListInvoicesParams {
+  customerId: string;
+  limit?: number;         // default 10
+  startingAfter?: string; // last invoice id of the previous page
+}
+
+interface InvoiceSummary {
+  id: string; status: InvoiceStatus;
+  amountDue: number; amountPaid: number; currency: string; created: number;
+  hostedInvoiceUrl: string | null; invoicePdf: string | null;
+  periodStart: number; periodEnd: number;
+}
+
+interface PaymentHistoryEntry {
+  id: string; amount: number; currency: string;
+  status: string; created: number; description: string | null;
+}
+
+interface PaymentMethodSummary {
+  id: string; type: string; isDefault: boolean;
+  card?: { brand: string; last4: string; expMonth: number; expYear: number };
+}
+
+interface UpcomingInvoiceSummary {
+  amountDue: number; currency: string;
+  periodStart: number; periodEnd: number; nextPaymentAttempt: number | null;
+}
+
+interface BillingCycleSummary {
+  currentPeriodStart: number; currentPeriodEnd: number;
+  status: Stripe.Subscription.Status; cancelAtPeriodEnd: boolean;
 }
 ```
 
-Or from a Client Component, once you have the URL:
+## Examples
+
+### Customer Portal
+
+```ts
+"use server";
+import { redirect } from "next/navigation";
+import { createCustomerPortalSession } from "@/lib/payments/stripe/billing-management/actions";
+
+export async function openPortal(customerId: string) {
+  const result = await createCustomerPortalSession({
+    customerId,
+    returnUrl: "https://example.com/account/billing",
+  });
+  if (!result.success) return { error: result.error };
+  redirect(result.data.url);
+}
+```
+
+From a Client Component that already has the URL:
 
 ```ts
 "use client";
-import { redirectToCustomerPortal } from "@/lib/stripe-billing/client";
+import { redirectToCustomerPortal } from "@/lib/payments/stripe/billing-management/client";
 
 redirectToCustomerPortal(url);
 ```
 
-### Invoices
+### Invoices and payment history
 
 ```ts
-import { listInvoices, getInvoice, getInvoiceStatus } from "@/lib/stripe-billing/actions";
+import {
+  listInvoices, getInvoice, getInvoiceStatus, listPaymentHistory,
+} from "@/lib/payments/stripe/billing-management/actions";
 
-const invoices = await listInvoices({ customerId });
-const invoice = await getInvoice(invoiceId);
+const invoices = await listInvoices({ customerId, limit: 20 });
+const next = await listInvoices({ customerId, startingAfter: lastInvoiceId });
+
+const invoice = await getInvoice(invoiceId);          // hostedInvoiceUrl, invoicePdf
 const status = await getInvoiceStatus(invoiceId);
-```
-
-### Payment history
-
-```ts
-import { listPaymentHistory } from "@/lib/stripe-billing/actions";
-
 const history = await listPaymentHistory(customerId);
 ```
 
-### Payment methods
+### Payment methods and update flow
 
 ```ts
-import { listPaymentMethods } from "@/lib/stripe-billing/actions";
+// Server: list and start the update
+import {
+  listPaymentMethods, createSetupIntent, setDefaultPaymentMethod,
+} from "@/lib/payments/stripe/billing-management/actions";
 
 const methods = await listPaymentMethods(customerId);
-// each entry includes isDefault
+const setup = await createSetupIntent(customerId);
+// setup.data.clientSecret → pass it to your Elements form
 ```
 
-### Update payment method (SetupIntent + Stripe Elements)
-
-Server side:
-
 ```ts
-import { createSetupIntent } from "@/lib/stripe-billing/actions";
-
-const result = await createSetupIntent(customerId);
-// result.data.clientSecret — pass to your Elements form
-```
-
-Client side, after collecting card details with Stripe Elements:
-
-```ts
+// Client, after Elements produced a paymentMethodId
 "use client";
-import { confirmCardSetup } from "@/lib/stripe-billing/client";
+import { confirmCardSetup } from "@/lib/payments/stripe/billing-management/client";
 
-const result = await confirmCardSetup(clientSecret, paymentMethodId);
+const confirmed = await confirmCardSetup(clientSecret, paymentMethodId);
 ```
 
-Then finish by setting it as the default:
-
 ```ts
-import { setDefaultPaymentMethod } from "@/lib/stripe-billing/actions";
-
-await setDefaultPaymentMethod(customerId, result.data.paymentMethodId);
+// Server: make it the default
+if (confirmed.success) {
+  await setDefaultPaymentMethod(customerId, confirmed.data.paymentMethodId);
+}
 ```
 
-### Upcoming invoice & billing cycle
+### Upcoming invoice and billing cycle
 
 ```ts
-import { getUpcomingInvoice, getBillingCycle } from "@/lib/stripe-billing/actions";
+import { getUpcomingInvoice, getBillingCycle } from "@/lib/payments/stripe/billing-management/actions";
 
 const upcoming = await getUpcomingInvoice(customerId);
 const cycle = await getBillingCycle(subscriptionId);
 ```
-
-## Error handling
-
-Every `actions.ts` and `client.ts` function returns:
-
-```ts
-{ success: true, data: T } | { success: false, error: string }
-```
-
-Always check `result.success` before reading `result.data` — nothing
-throws across the module boundary.
-
-## Notes
-
-- `service.ts` is the only file that imports the `stripe` package or reads
-  `STRIPE_SECRET_KEY` / `STRIPE_BILLING_WEBHOOK_SECRET`.
-- This module doesn't create or manage subscriptions — `getBillingCycle`
-  reads an existing subscription's dates/status, it doesn't create one.
-- If you need to look up a customer's `subscriptionId` from your own DB,
-  that lookup happens outside this module — it's app-specific, not a
-  Stripe billing concern.

@@ -1,170 +1,172 @@
-# Lemon Squeezy — One-time Payments module
+# Lemon Squeezy — One-time Payments
 
-A self-contained module for one-time payments via Lemon Squeezy in a Next.js
-app. No subscriptions, no billing — just: checkout → order → refund →
-webhooks.
+## Description
 
-## Dependency
+One-time payments with Lemon Squeezy for Next.js (App Router). Covers: create checkout, get payment (Order), payment status, payment success/failure, refund / partial refund, payment method data, and webhooks.
 
-This module uses the official SDK:
+Architecture:
 
-```
-@lemonsqueezy/lemonsqueezy.js
-```
+- `service.ts` — internal logic (SDK calls, mapping, webhook signature verification). Never import it from components or routes, except the webhook route handler.
+- `actions.ts` — server-only functions. Import from Server Components / Server Actions / route handlers.
+- `client.ts` — browser-only helpers (`"use client"`). They never use the API key.
+- `types.ts` — shared types.
 
-(It will resolve automatically once you install your project's
-dependencies — nothing else to install manually.)
+All `actions.ts` functions never throw: they return `PaymentResult<T>` = `{ success: true; data: T } | { success: false; error: string }`.
 
-## File map
+### Lemon Squeezy specifics and limitations
 
-```
-lib/lemonsqueezy/
-  service.ts   Internal logic (SDK calls, mapping, signature verification).
-               Not meant to be imported outside this folder.
-  actions.ts   Server-side functions, ready to import in Server Components
-               or Server Actions. Every function returns
-               { success: true, data } | { success: false, error }.
-  types.ts     Shared types (Order, Checkout, Refund, Webhook payload).
-  client.ts    Client-side helpers ("use client"): redirect/open checkout,
-               poll a status endpoint.
+- **Order = payment.** Lemon Squeezy has no "create payment" endpoint and no Payment Intent. A payment is an **Order**, created automatically when the customer completes a **Checkout**. "Create checkout" is the only creation call. Use the Order id (`order_id`) as the payment identifier everywhere.
+- **Cancellation is not implemented on purpose.** There is no API to cancel a paid Order. An unfinished Checkout expires on its own (see `expiresAt` in `CheckoutResult`). Do not add a cancel function.
+- **Refund / partial refund use one endpoint.** `refundPayment` with `amount` (in cents) = partial refund; without `amount` = full refund.
+- **Payment methods:** Lemon Squeezy has no payment-methods API for one-time orders. `getPaymentMethod` only returns the card brand / last4 stored on the Order (both may be `null`).
+- **Success/failure are functions, not pages.** They read `order_id` from the query params and check the Order status. Lemon Squeezy does NOT append any id to `redirectUrl` automatically, and there is no endpoint to look up an Order by the `customData` attached to a Checkout. To get an `order_id` into the redirect, persist the mapping (your own reference → Order id) in the `order_created` webhook (marked spot in `route.ts`) and build the redirect from your own storage.
+- **There is no `checkout_id` on the Order side.** Do not use it as a lookup key.
+- The webhook handler only logs events. Persistence / side effects must be added inside its `switch`.
+- The module assumes the `variantId` already exists in the Lemon Squeezy store (it does not manage products/variants).
 
-app/api/webhooks/lemonsqueezy/route.ts
-               Webhook receiver. Verifies the signature and handles events.
+## Dependencies
 
-.env.local     Environment variables (see below).
-```
+- `@lemonsqueezy/lemonsqueezy.js` (official SDK)
+- `server-only`
+- `next` (App Router)
 
 ## Environment variables
 
-| Variable | Where to find it |
-|---|---|
-| `LEMONSQUEEZY_API_KEY` | Dashboard → Settings → API → create an API key |
-| `LEMONSQUEEZY_STORE_ID` | Dashboard → Settings → Stores |
-| `LEMONSQUEEZY_WEBHOOK_SECRET` | Dashboard → Settings → Webhooks → your webhook's signing secret |
+| Variable | Required | Where to get it |
+|---|---|---|
+| `LEMONSQUEEZY_API_KEY` | yes | Dashboard → Settings → API |
+| `LEMONSQUEEZY_STORE_ID` | yes | Dashboard → Settings → Stores (numeric id) |
+| `LEMONSQUEEZY_WEBHOOK_SECRET` | yes | Dashboard → Settings → Webhooks → signing secret of the webhook pointing to `/api/webhooks/lemonsqueezy` |
 
-Use test-mode keys while developing; Lemon Squeezy test mode has its own
-isolated store data.
+## File structure
 
-## How the pieces fit together
+```
+lib/payments/lemon-squeezy/one-time/
+  service.ts   Internal. SDK calls, Order/Checkout mapping, verifyWebhookSignature, parseWebhookPayload.
+  actions.ts   Server-only public functions (see Public API).
+  client.ts    Client-only public functions (see Public API).
+  types.ts     CreateCheckoutParams, CheckoutResult, LemonSqueezyOrder, OrderStatus,
+               RefundOrderParams, RefundResult, PaymentResult, LemonSqueezyWebhookPayload.
 
-### 1. Creating a payment (checkout)
+app/api/webhooks/lemonsqueezy/route.ts
+               POST handler. Verifies the X-Signature header against the raw body, then handles
+               `order_created` and `order_refunded` (log only; add persistence here).
+               Register `https://<your-domain>/api/webhooks/lemonsqueezy` in the Lemon Squeezy
+               dashboard subscribed to those two events.
+```
 
-Lemon Squeezy has no separate "create payment" endpoint. A payment (an
-**Order**) is created automatically once the customer completes a
-**Checkout**. So "create checkout" and "create payment" are the same call:
+Imports use the `@/` alias, e.g. `@/lib/payments/lemon-squeezy/one-time/actions`.
+
+## Public API
+
+Shared shapes:
+
+- `OrderStatus` = `"pending" | "failed" | "paid" | "refunded" | "partial_refund" | "fraudulent"`
+- `LemonSqueezyOrder` = `{ id, identifier, storeId, customerId, status: OrderStatus, statusFormatted, currency, subtotal, tax, total, refundedAmount, refunded, refundedAt, userEmail, userName, createdAt, cardBrand, cardLastFour, receiptUrl }` (amounts in cents)
+
+### `lib/payments/lemon-squeezy/one-time/actions.ts` (server only)
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `createCheckout` | `params: { variantId: number; email?: string; customData?: Record<string, string \| number \| boolean>; redirectUrl?: string; embed?: boolean }` | `Promise<PaymentResult<{ id: string; url: string; expiresAt: string \| null }>>` |
+| `getPayment` | `orderId: string` | `Promise<PaymentResult<LemonSqueezyOrder>>` |
+| `getPaymentStatus` | `orderId: string` | `Promise<PaymentResult<OrderStatus>>` |
+| `getPaymentSuccess` | `searchParams: URLSearchParams \| Record<string, string \| string[] \| undefined>` (reads `order_id`) | `Promise<PaymentResult<LemonSqueezyOrder>>` — error if `order_id` is missing or status is not `"paid"` |
+| `getPaymentFailure` | `searchParams` (same as above, reads `order_id`) | `Promise<PaymentResult<{ orderId: string; status: OrderStatus }>>` — error if `order_id` is missing or the order is `"paid"` |
+| `refundPayment` | `params: { orderId: string; amount?: number }` (`amount` in cents; omit = full refund) | `Promise<PaymentResult<{ orderId: string; refunded: boolean; refundedAmount: number; status: OrderStatus }>>` |
+| `getPaymentMethod` | `orderId: string` | `Promise<PaymentResult<{ cardBrand: string \| null; cardLastFour: string \| null }>>` |
+
+### `lib/payments/lemon-squeezy/one-time/client.ts` (client only)
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `redirectToCheckout` | `checkoutUrl: string` | `void` — full-page redirect; throws if `checkoutUrl` is empty |
+| `openCheckoutOverlay` | `checkoutUrl: string` (checkout created with `embed: true`; needs Lemon.js loaded) | `void` — falls back to `redirectToCheckout` if Lemon.js is not loaded; throws if empty |
+| `pollPaymentStatus` | `statusEndpoint: string` (a route of yours that calls `getPaymentStatus`, responding `{ status }`), `options?: { intervalMs?: number; timeoutMs?: number }` (defaults 2000 / 60000) | `Promise<"paid" \| "failed" \| "refunded" \| "partial_refund" \| "fraudulent" \| "timeout">` |
+
+### `app/api/webhooks/lemonsqueezy/route.ts`
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | `request: NextRequest` (raw body + `x-signature` header) | `NextResponse`: `200 { received: true }`, `400` unreadable body / invalid JSON, `401` invalid signature, `500` misconfigured secret or handler error |
+
+## Examples
+
+Create a checkout (Server Action) and redirect (Client Component):
 
 ```ts
-import { createCheckout } from "@/lib/lemonsqueezy/actions";
+// app/actions/buy.ts
+"use server";
+import { createCheckout } from "@/lib/payments/lemon-squeezy/one-time/actions";
 
-const result = await createCheckout({
-  variantId: 123456,
-  email: "customer@example.com",
-  redirectUrl: "https://yourapp.com/payment/result",
-  customData: { internal_reference: "abc-123" }, // optional, see note below
-});
-
-if (result.success) {
-  // result.data.url -> send the customer here (or use client.ts helpers)
+export async function buy(variantId: number, email: string) {
+  return createCheckout({
+    variantId,
+    email,
+    redirectUrl: `${process.env.NEXT_PUBLIC_APP_URL}/payment/result`,
+  });
 }
 ```
 
-On the client:
+```tsx
+// components/BuyButton.tsx
+"use client";
+import { redirectToCheckout } from "@/lib/payments/lemon-squeezy/one-time/client";
+import { buy } from "@/app/actions/buy";
 
-```ts
-import { redirectToCheckout } from "@/lib/lemonsqueezy/client";
-redirectToCheckout(checkoutUrl);
+export function BuyButton({ variantId, email }: { variantId: number; email: string }) {
+  return (
+    <button
+      onClick={async () => {
+        const result = await buy(variantId, email);
+        if (result.success) redirectToCheckout(result.data.url);
+        else console.error(result.error);
+      }}
+    >
+      Buy
+    </button>
+  );
+}
 ```
 
-### 2. Reading a payment
+Success / failure state in a Server Component (`order_id` must be present in the query params):
 
-```ts
-import { getPayment, getPaymentStatus } from "@/lib/lemonsqueezy/actions";
+```tsx
+// app/payment/result/page.tsx
+import { getPaymentSuccess, getPaymentFailure } from "@/lib/payments/lemon-squeezy/one-time/actions";
 
-const order = await getPayment(orderId);
-const status = await getPaymentStatus(orderId); // "pending" | "paid" | "refunded" | ...
+export default async function Page({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = await searchParams;
+  const success = await getPaymentSuccess(params);
+  if (success.success) return <p>Paid: {success.data.total / 100} {success.data.currency}</p>;
+
+  const failure = await getPaymentFailure(params);
+  if (failure.success) return <p>Not paid. Status: {failure.data.status}</p>;
+
+  return <p>{failure.error}</p>;
+}
 ```
 
-### 3. Success / failure
-
-These are **not pages** — they're functions that read the order id from
-query params and check its status:
+Full and partial refund:
 
 ```ts
-import { getPaymentSuccess, getPaymentFailure } from "@/lib/lemonsqueezy/actions";
+import { refundPayment } from "@/lib/payments/lemon-squeezy/one-time/actions";
 
-const success = await getPaymentSuccess(searchParams); // succeeds only if status === "paid"
-const failure = await getPaymentFailure(searchParams); // succeeds if status !== "paid"
+await refundPayment({ orderId });               // full refund
+await refundPayment({ orderId, amount: 500 });  // partial refund of 5.00
 ```
 
-**Important limitation to know before wiring this up:** Lemon Squeezy does
-not append any id to your `redirectUrl` automatically, and there is no API
-endpoint to look up an Order by the `customData` you attached to a
-Checkout. The functions above expect a real Lemon Squeezy **`order_id`**
-as the query param — that's the identifier Lemon Squeezy actually works
-with (there is no "checkout_id" on the Order side). If you want to
-correlate the redirect back to your own reference, generated before
-creating the checkout, you need to:
-
-1. Pass that reference as `customData` when creating the checkout.
-2. Persist the mapping (`reference -> order id`) yourself when the
-   `order_created` webhook fires — there's a marked spot for this in
-   `app/api/webhooks/lemonsqueezy/route.ts`.
-3. Look up the order id from your own storage before calling
-   `getPaymentSuccess` / `getPaymentFailure`.
-
-This module intentionally doesn't include a database, so that lookup step
-is left for you to plug in wherever you persist data.
-
-### 4. Refunds (full and partial)
-
-Lemon Squeezy has a single refund endpoint. Passing `amount` (in cents)
-issues a partial refund; omitting it refunds the full order:
+Handling the result of any action:
 
 ```ts
-import { refundPayment } from "@/lib/lemonsqueezy/actions";
-
-await refundPayment({ orderId }); // full refund
-await refundPayment({ orderId, amount: 500 }); // partial refund, $5.00
+const result = await getPayment(orderId);
+if (!result.success) {
+  // result.error is a safe string message
+  return;
+}
+// result.data is LemonSqueezyOrder
 ```
-
-### 5. Payment method
-
-Lemon Squeezy doesn't expose a payment-methods API for one-time orders.
-`getPaymentMethod` just returns whatever card brand/last4 Lemon Squeezy
-recorded on the Order itself (may be `null` depending on the payment
-method used):
-
-```ts
-import { getPaymentMethod } from "@/lib/lemonsqueezy/actions";
-const method = await getPaymentMethod(orderId);
-```
-
-### 6. Cancellation — not implemented, on purpose
-
-There is no API to cancel a paid Order. An **unfinished** Checkout simply
-expires on its own (`CheckoutResult.expiresAt`) — there's nothing to call
-to cancel it manually. No function was added for this to avoid faking
-behavior Lemon Squeezy doesn't support.
-
-### 7. Webhooks
-
-Register `https://yourapp.com/api/webhooks/lemonsqueezy` in
-Dashboard → Settings → Webhooks, subscribed to:
-
-- `order_created`
-- `order_refunded`
-
-The route handler verifies the `X-Signature` header against
-`LEMONSQUEEZY_WEBHOOK_SECRET` using the raw request body, then dispatches
-on `event_name`. Add your own persistence/side effects inside the
-`switch` in `route.ts`.
-
-## Error handling
-
-- `service.ts` throws plain `Error`s with the Lemon Squeezy API's error
-  message when available.
-- `actions.ts` catches those and returns `{ success: false, error }` —
-  callers never need try/catch, just check `result.success`.
-- The webhook route returns `401` on bad signatures, `400` on malformed
-  payloads, and `500` if a handler throws, so Lemon Squeezy's retry logic
-  (exponential backoff, up to 3 retries) kicks in correctly.

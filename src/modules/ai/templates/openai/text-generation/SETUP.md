@@ -1,45 +1,111 @@
-# OpenAI Text Generation — Setup
+# OpenAI Text Generation
 
-Drop-in text generation module for Next.js (App Router) using the OpenAI SDK.
-Covers text generation, streaming, system/user prompts, temperature config,
-and structured output (JSON schema).
+Text generation with the OpenAI SDK for Next.js (App Router): single-shot generation, streaming, system and user prompts, temperature and token configuration, and structured output validated against a JSON Schema.
 
 ## Dependencies
 
-- `openai` — official OpenAI SDK
+- `openai`
+- `server-only`
 
 ## Environment variables
 
-See `.env.local`:
-
-- `OPENAI_API_KEY` — required.
+| Variable | Required | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | OpenAI API key. Read on the server only. |
 
 ## File structure
 
 ```
-lib/openai/
-├── service.ts        # Internal logic (SDK calls, error normalization). Do not import directly.
-├── actions.ts         # "use server" — public API for Server Components (generateText, generateStructuredOutput)
-├── client.ts            # Public API for Client Components (streamText)
-├── types.ts               # Types, default model/token config, rate limit config
-├── stream/
-│   ├── handler.ts        # Internal — builds the ReadableStream. Do not import directly.
-│   └── route.ts            # Copy to app/api/openai/stream/route.ts
-└── .env.local
+lib/ai/openai/text-generation/
+├── actions.ts        # "use server" — public API for server code
+├── client.ts         # Public API for Client Components (streaming)
+├── service.ts        # Internal — SDK calls, rate limit retry, error normalization. Never import directly.
+├── types.ts          # Types, defaults (model, tokens, temperature) and rate limit config
+└── stream/
+    └── handler.ts    # Internal — builds the text ReadableStream. Used only by the route handler.
+
+app/api/openai/stream/route.ts   # POST route handler (streaming)
 ```
 
-## Setup steps
+`client.ts` calls `/api/openai/stream` (the `STREAM_ENDPOINT` constant). Keep it in sync with the route's location.
 
-1. Copy the `lib/openai/` folder into your project.
-2. Copy `lib/openai/stream/route.ts` to `app/api/openai/stream/route.ts`.
-3. Set `OPENAI_API_KEY` in your project's `.env.local`.
+## Public API
 
-## Usage
+### `actions.ts` — `@/lib/ai/openai/text-generation/actions`
 
-### From a Server Component / server action (non-streaming)
+Server-side. Never throw: always check `result.ok`.
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `generateTextAction` | `options: GenerateTextOptions` | `Promise<AIActionResult<GenerateTextResult>>` |
+| `generateStructuredOutputAction<T>` | `options: GenerateStructuredOutputOptions` | `Promise<AIActionResult<GenerateStructuredOutputResult<T>>>` |
+
+### `client.ts` — `@/lib/ai/openai/text-generation/client`
+
+Browser-side. Throws an `AIActionError` on failure (use `try/catch`).
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `streamText` | `options: GenerateTextOptions` | `AsyncGenerator<string>` — yields text chunks as they arrive |
+
+### Route handler — `app/api/openai/stream/route.ts`
+
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | JSON body: `GenerateTextOptions` | `200` with a `text/plain` stream of text chunks. On failure, JSON `{ error: AIActionError }` with status `429` (`RATE_LIMITED`), `401` (`AUTH_ERROR`), `400` (`INVALID_REQUEST`), `504` (`TIMEOUT`) or `500` (anything else). |
+
+### Types — `@/lib/ai/openai/text-generation/types`
 
 ```ts
-import { generateTextAction } from "@/lib/openai/actions";
+interface GenerateTextOptions {
+  prompt: string;            // user prompt
+  systemPrompt?: string;
+  model?: string;            // default "gpt-4o-mini"
+  temperature?: number;      // default 0.7
+  maxOutputTokens?: number;  // default 1024, capped at 4096
+}
+
+interface GenerateTextResult {
+  text: string;
+  model: string;
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+}
+
+interface GenerateStructuredOutputOptions extends GenerateTextOptions {
+  schema: Record<string, unknown>; // JSON Schema describing the output
+  schemaName: string;              // identifier required by the OpenAI API
+}
+
+interface GenerateStructuredOutputResult<T> {
+  data: T;
+  model: string;
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+}
+
+type AIActionResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: AIActionError };
+
+interface AIActionError {
+  code: "RATE_LIMITED" | "INVALID_REQUEST" | "AUTH_ERROR" | "TIMEOUT" | "UNKNOWN";
+  message: string;      // safe to show in the UI
+  retryable: boolean;
+  retryAfter?: number;  // seconds — only set for RATE_LIMITED
+}
+```
+
+### Behavior
+
+- **Rate limit:** `generateTextAction` and `generateStructuredOutputAction` retry a 429 up to 2 times with exponential backoff. If retries run out, the result is `RATE_LIMITED` with `retryAfter` in seconds (from OpenAI's `retry-after` header, 20 by default). `streamText` and the route do not retry: a 429 before the stream starts is thrown immediately as `RATE_LIMITED`.
+- **Structured output** uses OpenAI strict JSON Schema mode: every object level needs `additionalProperties: false` and all of its properties listed in `required`. A schema that breaks this, or a model reply that is not valid JSON, returns `INVALID_REQUEST`.
+- **Failure after the stream has started:** the connection is closed and no JSON error can be sent. Treat a truncated stream as a failed request in the UI.
+
+## Examples
+
+### Generate text (server)
+
+```ts
+import { generateTextAction } from "@/lib/ai/openai/text-generation/actions";
 
 const result = await generateTextAction({
   prompt: "Write a haiku about the ocean",
@@ -50,15 +116,14 @@ const result = await generateTextAction({
 if (result.ok) {
   console.log(result.data.text);
 } else {
-  // result.error: { code, message, retryable, retryAfter? }
-  console.error(result.error.message);
+  console.error(result.error.code, result.error.message);
 }
 ```
 
-### Structured output
+### Structured output (server)
 
 ```ts
-import { generateStructuredOutputAction } from "@/lib/openai/actions";
+import { generateStructuredOutputAction } from "@/lib/ai/openai/text-generation/actions";
 
 const result = await generateStructuredOutputAction<{ title: string; tags: string[] }>({
   prompt: "Summarize this article: ...",
@@ -75,20 +140,20 @@ const result = await generateStructuredOutputAction<{ title: string; tags: strin
 });
 
 if (result.ok) {
-  console.log(result.data.data.title);
+  console.log(result.data.data.title); // result.data.data is the parsed object
 }
 ```
 
-### From a Client Component (streaming)
+### Streaming with error handling (client)
 
 ```tsx
 "use client";
 
 import { useState } from "react";
-import { streamText } from "@/lib/openai/client";
-import type { AIActionError } from "@/lib/openai/types";
+import { streamText } from "@/lib/ai/openai/text-generation/client";
+import type { AIActionError } from "@/lib/ai/openai/text-generation/types";
 
-export function Chat() {
+export function StreamedText() {
   const [text, setText] = useState("");
   const [error, setError] = useState<AIActionError | null>(null);
 
@@ -97,7 +162,7 @@ export function Chat() {
     setError(null);
 
     try {
-      for await (const chunk of streamText({ prompt: "Tell me a story" })) {
+      for await (const chunk of streamText({ prompt: "Tell me a short story" })) {
         setText((prev) => prev + chunk);
       }
     } catch (err) {
@@ -111,7 +176,7 @@ export function Chat() {
       {error && (
         <p>
           {error.code === "RATE_LIMITED"
-            ? `Too many requests — try again in ${error.retryAfter}s`
+            ? `Too many requests. Try again in ${error.retryAfter}s.`
             : error.message}
         </p>
       )}
@@ -120,41 +185,3 @@ export function Chat() {
   );
 }
 ```
-
-## Error handling
-
-Every function returns/throws the same normalized shape instead of raw
-OpenAI SDK errors:
-
-```ts
-interface AIActionError {
-  code: "RATE_LIMITED" | "INVALID_REQUEST" | "AUTH_ERROR" | "TIMEOUT" | "UNKNOWN";
-  message: string;
-  retryable: boolean;
-  retryAfter?: number; // seconds, only set for RATE_LIMITED
-}
-```
-
-- `actions.ts` functions never throw — they return `{ ok: false, error }`.
-- `client.ts`'s `streamText` throws the `AIActionError` — use try/catch.
-
-## Rate limiting
-
-Handled as part of the same error system, not separately:
-
-- `generateText` / `generateStructuredOutput` automatically retry on a 429
-  with exponential backoff (see `RATE_LIMIT_CONFIG` in `types.ts`), up to
-  `maxRetries`. If retries are exhausted, the error surfaces as
-  `RATE_LIMITED` with a `retryAfter` (seconds) taken from OpenAI's
-  `retry-after` header when present.
-- `streamText` does not auto-retry (a stream can't be safely resumed
-  mid-way) — a 429 before the stream starts surfaces immediately as
-  `RATE_LIMITED`.
-
-## Known limitation
-
-If a streaming request fails **after** the response has started (rare —
-usually only a mid-stream network/API failure), the connection is simply
-closed. No JSON error can be sent at that point since the HTTP response
-already started as `text/plain`. Handle this in the UI by treating an
-unexpectedly short/incomplete stream as a soft failure.

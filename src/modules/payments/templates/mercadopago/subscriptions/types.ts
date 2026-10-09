@@ -123,8 +123,8 @@ export interface ExpirationInfo {
 /** Shape of the notification body Mercado Pago sends to the webhook route. */
 export interface SubscriptionWebhookNotification {
   id?: number;
-  /** "preapproval" (lifecycle) or "subscription_authorized_payment" (a recurring charge). */
-  type: "preapproval" | "subscription_authorized_payment";
+  /** "subscription_preapproval" (lifecycle; "preapproval" kept as legacy alias) or "subscription_authorized_payment" (a recurring charge). */
+  type: "subscription_preapproval" | "preapproval" | "subscription_authorized_payment";
   action?: string;
   data: {
     id: string;

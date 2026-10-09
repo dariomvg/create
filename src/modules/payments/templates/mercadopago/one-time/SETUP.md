@@ -1,132 +1,187 @@
-# Mercado Pago — One-time Payments Module
+# Mercado Pago — One-time Payments
 
-Complete module for handling one-time payments through Mercado Pago
-(Checkout Pro) in a Next.js App Router project. No subscriptions, no
-billing — just: checkout, payment lookup, cancellation, refunds, payment
-methods, and webhooks.
+## Description
 
-## Dependency
+One-time payments with Mercado Pago (Checkout Pro) for Next.js (App Router). Covers: create checkout, get payment, payment status, payment success/failure, cancellation, refund / partial refund, payment methods, and webhooks.
 
-This module uses Mercado Pago's official Node SDK:
+Architecture:
 
-- `mercadopago` (v2)
+- `service.ts` — internal logic (SDK calls, mapping, webhook signature verification). Never import it from components or routes, except the webhook route handler.
+- `actions.ts` — server functions (`"use server"`). Import from Server Components, or call as Server Actions from Client Components.
+- `client.ts` — browser-only helpers. They never use the access token.
+- `types.ts` — shared types.
+
+All `actions.ts` functions never throw: they return `MPResult<T>` = `{ success: true; data: T } | { success: false; error: string; code?: string }`. Always check `result.success` before reading `result.data`.
+
+### Mercado Pago specifics and limitations
+
+- **Checkout = Preference.** "Create checkout" creates a Checkout Pro **Preference** and returns a redirect URL. There is no "create payment" call: Mercado Pago creates the **Payment** on its side once the user pays. Use the Payment id (`payment_id`) as the payment identifier everywhere.
+- **Redirect URLs.** Use `initPoint` with production credentials and `sandboxInitPoint` with test credentials. After checkout, Mercado Pago redirects to the matching `backUrls` entry (`success` / `failure` / `pending`) and appends `payment_id` (plus `status`, `external_reference`, `preference_id`, among others) to the query string.
+- **Success/failure are functions, not pages.** `checkPaymentSuccess` / `checkPaymentFailure` take the `payment_id` read from the query params and check the Payment status. A `pending` or `in_process` payment is neither success nor failure (both functions report `false`).
+- **Status values** (`PaymentStatus`): `pending`, `approved`, `authorized`, `in_process`, `in_mediation`, `rejected`, `cancelled`, `refunded`, `charged_back`. The field is called `status` (with `statusDetail` for the reason).
+- **Cancellation is implemented, with a constraint.** `cancelPayment` only works while the payment is `pending` or `in_process`. An `approved` payment cannot be cancelled: refund it instead. The module does not pre-check; Mercado Pago's error comes back as `{ success: false, error }`.
+- **Refund / partial refund use one endpoint.** `refundPayment` = full refund; `partialRefundPayment` with `amount` = partial refund. Amounts are in currency units (decimal, e.g. `500.5`), NOT cents.
+- **Payment methods are account-level.** `getPaymentMethods` lists the methods enabled for the account/country. It is not tied to a specific payment.
+- The webhook handler only logs events. Persistence / side effects must be added inside the marked block in `route.ts`.
+- Webhook processing returns `200` even if fetching the payment fails (logged), to avoid endless retries from Mercado Pago.
+- `service.ts` throws at import time if `MERCADOPAGO_ACCESS_TOKEN` is missing.
+
+## Dependencies
+
+- `mercadopago` (official SDK, v2)
+- `next` (App Router)
+
+## Environment variables
+
+| Variable | Required | Where to get it |
+|---|---|---|
+| `MERCADOPAGO_ACCESS_TOKEN` | yes | Developer Dashboard → your application → Credentials (test or production access token) |
+| `MERCADOPAGO_WEBHOOK_SECRET` | yes | Developer Dashboard → your application → Webhooks → signature secret of the webhook pointing to `/api/webhooks/mercadopago` |
+| `NEXT_PUBLIC_APP_URL` | no | Your app's public base URL. Not read by the module; use it to build the `backUrls` you pass to `createCheckout` |
 
 ## File structure
 
 ```
-lib/mercadopago/
-  service.ts   Direct Mercado Pago SDK calls. Internal only — don't import
-               this from components, go through actions.ts or client.ts.
-  actions.ts   Server-side functions ready to import into server components
-               (or call as Server Actions from client components).
-  types.ts     Shared TypeScript types for preferences, payments, refunds,
-               payment methods, and webhook payloads.
-  client.ts    The one client-side helper this module needs: redirecting
-               the browser to the Mercado Pago checkout page.
+lib/payments/mercadopago/one-time/
+  service.ts   Internal. SDK calls, Payment/Preference mapping, verifyWebhookSignature.
+  actions.ts   Server public functions (see Public API).
+  client.ts    Client public function (see Public API).
+  types.ts     CreatePreferenceInput, MPPreferenceItem, MPBackUrls, MPPreferenceResult, MPPayment,
+               PaymentStatus, PaymentStatusResult, RefundResult, PaymentMethodInfo,
+               WebhookNotification, MPResult, MPErrorResult.
 
 app/api/webhooks/mercadopago/route.ts
-  Receives and validates Mercado Pago's payment notifications.
-
-.env.local
-  Environment variables (see below).
+               POST handler. Verifies x-signature / x-request-id against data.id, then handles
+               `payment` notifications (fetches the Payment and logs; add persistence here).
+               Register `https://<your-domain>/api/webhooks/mercadopago` in the Mercado Pago
+               dashboard subscribed to payment events.
 ```
 
-## Environment variables
+Imports use the `@/` alias, e.g. `@/lib/payments/mercadopago/one-time/actions`.
 
-| Variable | Where to find it |
-|---|---|
-| `MERCADOPAGO_ACCESS_TOKEN` | Mercado Pago Developer Dashboard → Your application → Production/Test credentials → Access Token |
-| `MERCADOPAGO_WEBHOOK_SECRET` | Developer Dashboard → Your application → Webhooks → Signature secret |
-| `NEXT_PUBLIC_APP_URL` | Your app's own public base URL (e.g. `https://yourapp.com`, or an ngrok/tunnel URL while testing webhooks locally) |
+## Public API
 
-Use **test credentials** while developing — Mercado Pago's sandbox lets you
-simulate approved/rejected/pending payments with test cards, without
-touching the production API.
+Shared shapes:
 
-## How the flow works
+- `PaymentStatus` = `"pending" | "approved" | "authorized" | "in_process" | "in_mediation" | "rejected" | "cancelled" | "refunded" | "charged_back"`
+- `PaymentStatusResult` = `{ id: number; status: PaymentStatus; statusDetail: string }`
+- `MPPayment` = `{ id: number; status: PaymentStatus; statusDetail: string; transactionAmount: number; currencyId: string; dateCreated: string; dateApproved: string | null; externalReference: string | null; metadata: Record<string, unknown>; payerEmail: string | null }`
+- `RefundResult` = `{ id: number; paymentId: number; amount: number; status: string; dateCreated: string }`
+- `PaymentMethodInfo` = `{ id: string; name: string; paymentTypeId: string; status: string; thumbnail: string }`
 
-1. **Create a checkout** — call `createCheckout` from `actions.ts` with your
-   items and `back_urls`. It returns `initPoint` (production) and
-   `sandboxInitPoint` (test credentials).
-2. **Redirect the user** — from a client component, pass that URL to
-   `redirectToCheckout` in `client.ts`.
-3. **User pays** on Mercado Pago's hosted checkout page.
-4. **Mercado Pago redirects back** to whichever `back_urls` entry matches
-   the outcome (`success`, `failure`, or `pending`), appending a
-   `payment_id` query param.
-5. **You resolve the outcome** by reading `payment_id` from the URL on that
-   page and calling `checkPaymentSuccess` / `checkPaymentFailure` /
-   `getPaymentStatus` from `actions.ts`. These are plain functions, not
-   generated pages — wire them into whatever success/failure UI you already
-   have.
-6. **Mercado Pago also calls your webhook** (`app/api/webhooks/mercadopago/route.ts`)
-   independently of the redirect — treat the webhook as your source of
-   truth for order fulfillment, and the redirect as just the user-facing UX.
-   The redirect can be skipped by the user (closing the tab, etc.), the
-   webhook can't.
+### `lib/payments/mercadopago/one-time/actions.ts` (server)
 
-## Naming notes (Mercado Pago-specific)
+| Export | Arguments | Returns |
+|---|---|---|
+| `createCheckout` | `input: { items: { id?: string; title: string; description?: string; quantity: number; unit_price: number; currency_id?: string }[]; backUrls: { success: string; failure: string; pending: string }; metadata?: Record<string, unknown>; externalReference?: string; autoReturn?: "approved" \| "all" }` | `Promise<MPResult<{ id: string; initPoint: string; sandboxInitPoint: string }>>` — error if `items` is empty |
+| `getPayment` | `paymentId: string \| number` | `Promise<MPResult<MPPayment>>` |
+| `getPaymentStatus` | `paymentId: string \| number` | `Promise<MPResult<PaymentStatusResult>>` |
+| `checkPaymentSuccess` | `paymentId: string \| number` (the `payment_id` query param) | `Promise<MPResult<{ success: boolean; payment: PaymentStatusResult }>>` — `success` is `true` only when status is `"approved"` |
+| `checkPaymentFailure` | `paymentId: string \| number` (the `payment_id` query param) | `Promise<MPResult<{ failed: boolean; payment: PaymentStatusResult }>>` — `failed` is `true` when status is `"rejected"` or `"cancelled"` |
+| `cancelPayment` | `paymentId: string \| number` | `Promise<MPResult<MPPayment>>` — only valid for `pending` / `in_process` payments |
+| `refundPayment` | `paymentId: string \| number` | `Promise<MPResult<RefundResult>>` — full refund |
+| `partialRefundPayment` | `paymentId: string \| number`, `amount: number` (> 0, currency units) | `Promise<MPResult<RefundResult>>` |
+| `getPaymentMethods` | none | `Promise<MPResult<PaymentMethodInfo[]>>` |
 
-- "Checkout" maps to Mercado Pago's **Preference** resource (Checkout Pro).
-  There's no separate "create payment" step on our side — Mercado Pago
-  creates the actual **Payment** resource on their end once the user pays;
-  we only ever read it (`getPayment`, `getPaymentStatus`).
-- **Cancellation** isn't a dedicated endpoint — it's updating a payment's
-  `status` to `cancelled`, and only works while the payment is `pending` or
-  `in_process`. An `approved` payment can't be cancelled, only refunded.
-- **Refund** and **partial refund** use the same underlying endpoint —
-  omitting `amount` does a full refund, passing it does a partial one.
-  `actions.ts` exposes them as two separate functions (`refundPayment`,
-  `partialRefundPayment`) for clarity.
-- **Payment methods** (`getPaymentMethods`) lists the methods enabled for
-  your Mercado Pago account/country — it's not tied to a specific payment.
+### `lib/payments/mercadopago/one-time/client.ts` (client)
 
-## Webhook setup
+| Export | Arguments | Returns |
+|---|---|---|
+| `redirectToCheckout` | `checkoutUrl: string` (`initPoint` or `sandboxInitPoint`) | `void` — full-page redirect; throws if `checkoutUrl` is empty |
 
-1. In the Developer Dashboard, go to your application → **Webhooks**.
-2. Set the notification URL to `https://yourdomain.com/api/webhooks/mercadopago`.
-3. Subscribe to the `payments` topic.
-4. Copy the **signature secret** shown there into `MERCADOPAGO_WEBHOOK_SECRET`.
+### `app/api/webhooks/mercadopago/route.ts`
 
-The route handler verifies the `x-signature` header on every request and
-rejects anything that doesn't match before touching the payment — see the
-comment in `service.ts`'s `verifyWebhookSignature` for how the signature is
-computed.
+| Export | Arguments | Returns |
+|---|---|---|
+| `POST` | `request: NextRequest` (JSON body + `x-signature` and `x-request-id` headers) | `NextResponse`: `200 { received: true }`, `400` invalid JSON or missing signature / request id / `data.id`, `401` invalid signature, `500` misconfigured secret |
 
-To fill in your own business logic (marking an order as paid, sending a
-confirmation email, etc.), edit the commented block inside
-`app/api/webhooks/mercadopago/route.ts`.
+## Examples
 
-## Optional: an "orders" table
-
-This module only talks to Mercado Pago — it doesn't persist anything. If
-you want to track purchases in your own database, a minimal generic table
-looks like this:
-
-```sql
-CREATE TABLE orders (
-  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  external_reference  TEXT UNIQUE NOT NULL,   -- pass this as externalReference to createCheckout
-  mp_payment_id       TEXT,                   -- filled in once the webhook resolves the payment
-  status              TEXT NOT NULL DEFAULT 'pending', -- pending | approved | cancelled | refunded
-  amount              NUMERIC NOT NULL,
-  currency            TEXT NOT NULL,
-  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-
-Typical flow: create a row with `status = 'pending'` right before calling
-`createCheckout`, then update `status` and `mp_payment_id` inside the
-webhook handler once you read the payment's real status.
-
-## Error handling
-
-Every function in `service.ts` and `actions.ts` returns a result object
-instead of throwing:
+Create a checkout (Server Action) and redirect (Client Component):
 
 ```ts
-{ success: true, data: T } | { success: false, error: string, code?: string }
+// app/actions/buy.ts
+"use server";
+import { createCheckout } from "@/lib/payments/mercadopago/one-time/actions";
+
+export async function buy(orderId: string) {
+  const base = process.env.NEXT_PUBLIC_APP_URL;
+  return createCheckout({
+    items: [{ title: "Pro license", quantity: 1, unit_price: 49.9, currency_id: "ARS" }],
+    externalReference: orderId,
+    backUrls: {
+      success: `${base}/payment/success`,
+      failure: `${base}/payment/failure`,
+      pending: `${base}/payment/pending`,
+    },
+  });
+}
 ```
 
-Always check `result.success` before using `result.data`.
+```tsx
+// components/BuyButton.tsx
+"use client";
+import { redirectToCheckout } from "@/lib/payments/mercadopago/one-time/client";
+import { buy } from "@/app/actions/buy";
+
+export function BuyButton({ orderId }: { orderId: string }) {
+  return (
+    <button
+      onClick={async () => {
+        const result = await buy(orderId);
+        if (result.success) redirectToCheckout(result.data.initPoint); // sandboxInitPoint with test credentials
+        else console.error(result.error);
+      }}
+    >
+      Buy
+    </button>
+  );
+}
+```
+
+Success / failure state in a Server Component (`payment_id` must be present in the query params):
+
+```tsx
+// app/payment/success/page.tsx
+import { checkPaymentSuccess } from "@/lib/payments/mercadopago/one-time/actions";
+
+export default async function Page({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const { payment_id } = await searchParams;
+  if (typeof payment_id !== "string") return <p>Missing payment_id</p>;
+
+  const result = await checkPaymentSuccess(payment_id);
+  if (!result.success) return <p>{result.error}</p>;
+  if (!result.data.success) return <p>Not approved. Status: {result.data.payment.status}</p>;
+
+  return <p>Payment approved</p>;
+}
+```
+
+Cancel, full refund and partial refund:
+
+```ts
+import {
+  cancelPayment,
+  refundPayment,
+  partialRefundPayment,
+} from "@/lib/payments/mercadopago/one-time/actions";
+
+await cancelPayment(paymentId);              // only pending / in_process
+await refundPayment(paymentId);              // full refund of an approved payment
+await partialRefundPayment(paymentId, 10.5); // partial refund of 10.50
+```
+
+Handling the result of any action:
+
+```ts
+const result = await getPayment(paymentId);
+if (!result.success) {
+  // result.error is a message string; result.code is Mercado Pago's HTTP status when available
+  return;
+}
+// result.data is MPPayment
+```

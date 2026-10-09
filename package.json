@@ -1,6 +1,6 @@
 {
   "name": "@dariomvg/create",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "CLI | add Auth - AI - Payments - Email to Next.js projects",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
     "dist",
     "bin",
     "src/modules/**/templates/**",
+    "src/agent-docs/**",
     "CHANGELOG.md"
   ],
   "publishConfig": {
@@ -36,7 +37,7 @@
     "email",
     "ai"
   ],
-  "homepage": "https://www.formaui.site",
+  "homepage": "https://www.cli.dariomvg.com",
   "author": {
     "name": "Dario",
     "url": "https://github.com/dariomvg"
